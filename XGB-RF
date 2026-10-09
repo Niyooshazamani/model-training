@@ -1,9 +1,13 @@
 # ================================================================
-# XGBOOST FEATURE SELECTION
-# ->
-# LOGISTIC REGRESSION CLASSIFIER
+# XGBOOST FEATURE SELECTOR -> RANDOM FOREST CLASSIFIER
 #
-# Repeated stratified holdout + internal 5-fold CV
+# 50 repeated stratified holdout splits
+# 85% training / 15% held-out test
+# Internal stratified 5-fold CV
+# Spearman correlation filtering inside CV
+# Feature counts: 3-10
+# Patient-level aggregation
+# Bootstrap 95% confidence intervals
 # ================================================================
 
 
@@ -12,16 +16,13 @@
 # ================================================================
 
 import os
-import sys
-import shutil
-import importlib
 import warnings
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from joblib import Memory
+from sklearn.base import BaseEstimator, TransformerMixin
 
 from sklearn.model_selection import (
     StratifiedShuffleSplit,
@@ -34,11 +35,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectFromModel
 
-# Feature selector
-from xgboost import XGBClassifier
-
-# Classifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 from sklearn.metrics import (
     roc_auc_score,
@@ -55,6 +52,8 @@ from sklearn.metrics import (
 )
 
 from sklearn.calibration import calibration_curve
+
+from xgboost import XGBClassifier
 
 
 warnings.filterwarnings("ignore")
@@ -74,7 +73,7 @@ ID_COL = None
 
 
 # ================================================================
-# ANALYSIS SETTINGS
+# 3. VALIDATION SETTINGS
 # ================================================================
 
 N_OUTER_SPLITS = 50
@@ -83,7 +82,9 @@ TEST_SIZE = 0.15
 
 INNER_FOLDS = 5
 
-FEATURE_COUNTS = list(range(3, 11))
+FEATURE_COUNTS = list(
+    range(3, 11)
+)
 
 CORRELATION_THRESHOLD = 0.90
 
@@ -95,13 +96,13 @@ N_BOOTSTRAP = 5000
 
 
 # ================================================================
-# 3. XGBOOST FEATURE SELECTOR SETTINGS
+# 4. FIXED XGBOOST FEATURE SELECTOR SETTINGS
 # ================================================================
 #
-# These settings remain FIXED for all analyses using
-# XGBoost as the feature selector.
+# XGBoost is used ONLY as the feature selector.
 #
-# Feature ranking is based on XGBoost gain importance.
+# Feature ranking is based on gain-based importance.
+#
 # ================================================================
 
 XGB_SELECTOR_N_ESTIMATORS = 100
@@ -122,7 +123,7 @@ XGB_SELECTOR_IMPORTANCE_TYPE = "gain"
 
 
 # ================================================================
-# 4. OUTPUT FOLDERS
+# 5. OUTPUT DIRECTORIES
 # ================================================================
 
 desktop = os.path.join(
@@ -133,13 +134,7 @@ desktop = os.path.join(
 
 OUTPUT_DIR = os.path.join(
     desktop,
-    "XGB_LR_Revised_Results"
-)
-
-
-os.makedirs(
-    OUTPUT_DIR,
-    exist_ok=True
+    "XGB_RF_Revised_Results"
 )
 
 
@@ -150,42 +145,31 @@ FIGURE_DIR = os.path.join(
 
 
 os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+
+os.makedirs(
     FIGURE_DIR,
     exist_ok=True
 )
 
 
-CACHE_ROOT = os.path.join(
-    OUTPUT_DIR,
-    "_sklearn_cache"
-)
-
-
-os.makedirs(
-    CACHE_ROOT,
-    exist_ok=True
-)
-
-
 # ================================================================
-# 5. CREATE CORRELATION FILTER MODULE
+# 6. CORRELATION FILTER
 # ================================================================
-
-correlation_module_path = os.path.join(
-    OUTPUT_DIR,
-    "correlation_filter_module.py"
-)
-
-
-correlation_module_code = r'''
-import numpy as np
-import pandas as pd
-
-from sklearn.base import (
-    BaseEstimator,
-    TransformerMixin
-)
-
+#
+# This transformer is INSIDE the sklearn Pipeline.
+#
+# Therefore:
+# - constant-feature removal
+# - Spearman correlation calculation
+# - correlated-feature removal
+#
+# are fitted only on the corresponding training fold.
+#
+# ================================================================
 
 class CorrelationFilter(
     BaseEstimator,
@@ -216,7 +200,7 @@ class CorrelationFilter(
             X = pd.DataFrame(X)
 
 
-        self.feature_names_in_ = np.array(
+        self.feature_names_in_ = np.asarray(
             X.columns
         )
 
@@ -240,16 +224,16 @@ class CorrelationFilter(
 
         X_temp = X.drop(
 
-            columns=self.constant_features_,
+            columns=
+                self.constant_features_,
 
-            errors="ignore"
+            errors=
+                "ignore"
         )
 
 
         # --------------------------------------------------------
-        # Spearman correlation
-        #
-        # Calculated ONLY on data supplied during fit()
+        # Absolute Spearman correlation
         # --------------------------------------------------------
 
         corr = X_temp.corr(
@@ -275,12 +259,15 @@ class CorrelationFilter(
 
             column
 
-            for column in upper.columns
+            for column
+            in upper.columns
 
             if (
+
                 upper[column]
                 >
                 self.threshold
+
             ).any()
         ]
 
@@ -289,7 +276,8 @@ class CorrelationFilter(
 
             column
 
-            for column in X_temp.columns
+            for column
+            in X_temp.columns
 
             if column
             not in self.correlated_features_
@@ -328,47 +316,13 @@ class CorrelationFilter(
         input_features=None
     ):
 
-        return np.array(
+        return np.asarray(
             self.features_to_keep_
         )
-'''
-
-
-with open(
-    correlation_module_path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    f.write(
-        correlation_module_code
-    )
-
-
-if OUTPUT_DIR not in sys.path:
-
-    sys.path.insert(
-        0,
-        OUTPUT_DIR
-    )
-
-
-import correlation_filter_module
-
-
-importlib.reload(
-    correlation_filter_module
-)
-
-
-CorrelationFilter = (
-    correlation_filter_module
-    .CorrelationFilter
-)
 
 
 # ================================================================
-# 6. LOAD DATA
+# 7. LOAD DATA
 # ================================================================
 
 df = pd.read_excel(
@@ -387,7 +341,7 @@ df.columns = (
 
 
 # ================================================================
-# FIND LABEL COLUMN
+# 8. FIND LABEL COLUMN
 # ================================================================
 
 if LABEL_COL not in df.columns:
@@ -403,18 +357,22 @@ if LABEL_COL not in df.columns:
 
     found_labels = [
 
-        c
+        column
 
-        for c in possible_labels
+        for column
+        in possible_labels
 
-        if c in df.columns
+        if column
+        in df.columns
     ]
 
 
-    if len(found_labels) == 0:
+    if len(
+        found_labels
+    ) == 0:
 
         raise ValueError(
-            "Label column was not found."
+            "Label column not found."
         )
 
 
@@ -422,7 +380,7 @@ if LABEL_COL not in df.columns:
 
 
 # ================================================================
-# FIND PATIENT ID COLUMN
+# 9. FIND PATIENT ID COLUMN
 # ================================================================
 
 if ID_COL is None:
@@ -430,23 +388,27 @@ if ID_COL is None:
     possible_ids = [
 
         "PatientID",
-        "Image",
         "patient_id",
+        "Image",
         "ID"
     ]
 
 
     found_ids = [
 
-        c
+        column
 
-        for c in possible_ids
+        for column
+        in possible_ids
 
-        if c in df.columns
+        if column
+        in df.columns
     ]
 
 
-    if len(found_ids) > 0:
+    if len(
+        found_ids
+    ) > 0:
 
         ID_COL = found_ids[0]
 
@@ -460,7 +422,7 @@ if ID_COL is None:
 
 
 # ================================================================
-# OUTCOME
+# 10. LABELS AND PATIENT IDs
 # ================================================================
 
 y = (
@@ -475,10 +437,6 @@ y = (
 )
 
 
-# ================================================================
-# PATIENT IDs
-# ================================================================
-
 patient_ids = (
 
     df[ID_COL]
@@ -492,29 +450,30 @@ patient_ids = (
 
 
 # ================================================================
-# REMOVE METADATA FROM FEATURE MATRIX
+# 11. REMOVE METADATA
 # ================================================================
 
 metadata_cols = [
 
     LABEL_COL,
-
     ID_COL,
 
+    "PatientID",
+    "patient_id",
+    "ID",
+    "RowID",
+
+    "Image",
     "ImageFile",
 
     "MaskFile",
-
     "MaskLabel",
 
     "ROIVoxels",
 
     "label",
-
     "Label",
-
     "Outcome",
-
     "outcome"
 ]
 
@@ -530,7 +489,7 @@ X = df.drop(
 
 
 # ================================================================
-# KEEP ONLY NUMERIC FEATURES
+# KEEP NUMERIC FEATURES ONLY
 # ================================================================
 
 non_numeric_columns = (
@@ -545,7 +504,9 @@ non_numeric_columns = (
 )
 
 
-if len(non_numeric_columns) > 0:
+if len(
+    non_numeric_columns
+) > 0:
 
     print(
         "Dropping non-numeric columns:",
@@ -571,7 +532,7 @@ X = X.reset_index(
 if X.isna().any().any():
 
     raise ValueError(
-        "Missing values were found in the feature matrix."
+        "Missing values found in feature matrix."
     )
 
 
@@ -580,7 +541,7 @@ if np.isinf(
 ).any():
 
     raise ValueError(
-        "Infinite values were found in the feature matrix."
+        "Infinite values found in feature matrix."
     )
 
 
@@ -589,20 +550,20 @@ if set(
 ) != {0, 1}:
 
     raise ValueError(
-        "Labels must be coded as 0 and 1."
+        "Outcome must contain only 0 and 1."
     )
 
 
 print(
-    "\n===================================="
+    "\n========================================"
 )
 
 print(
-    "DATA CHECK"
+    "DATASET"
 )
 
 print(
-    "===================================="
+    "========================================"
 )
 
 
@@ -613,13 +574,13 @@ print(
 
 
 print(
-    "Initial radiomic features:",
+    "Radiomics features:",
     X.shape[1]
 )
 
 
 print(
-    "Class distribution:"
+    "\nClass distribution:"
 )
 
 
@@ -629,32 +590,50 @@ print(
 
 
 # ================================================================
-# 7. LOGISTIC REGRESSION CLASSIFIER GRID
+# 12. RANDOM FOREST CLASSIFIER HYPERPARAMETER GRID
 # ================================================================
 #
-# 5 C values
-# × 2 penalties
-# × 2 class_weight settings
-# =
-# 20 combinations per candidate feature count
+# n_estimators:
+#   10, 50, 100, 200
+#
+# max_depth:
+#   None, 5, 10, 15
+#
+# min_samples_split:
+#   2, 5, 10
+#
+# class_weight:
+#   None, balanced
+#
+# Total:
+#
+# 4 × 4 × 3 × 2 = 96 combinations
 #
 # ================================================================
 
 param_grid = {
 
-    "classifier__C": [
+    "classifier__n_estimators": [
 
-        0.01,
-        0.1,
-        1,
         10,
-        100
+        50,
+        100,
+        200
     ],
 
-    "classifier__penalty": [
+    "classifier__max_depth": [
 
-        "l1",
-        "l2"
+        None,
+        5,
+        10,
+        15
+    ],
+
+    "classifier__min_samples_split": [
+
+        2,
+        5,
+        10
     ],
 
     "classifier__class_weight": [
@@ -666,7 +645,7 @@ param_grid = {
 
 
 print(
-    "\nLR classifier hyperparameter combinations:",
+    "\nRandom Forest hyperparameter combinations:",
     len(
         list(
             ParameterGrid(
@@ -678,7 +657,7 @@ print(
 
 
 # ================================================================
-# 8. METRIC FUNCTION
+# 13. METRIC FUNCTION
 # ================================================================
 
 def calculate_metrics(
@@ -700,8 +679,7 @@ def calculate_metrics(
     predictions = (
 
         probabilities
-        >=
-        threshold
+        >= threshold
 
     ).astype(int)
 
@@ -838,7 +816,7 @@ def calculate_metrics(
 
 
 # ================================================================
-# 9. REPEATED STRATIFIED HOLDOUT
+# 14. OUTER REPEATED STRATIFIED HOLDOUT
 # ================================================================
 
 outer_splitter = StratifiedShuffleSplit(
@@ -870,7 +848,7 @@ chosen_parameter_records = []
 
 
 # ================================================================
-# 10. MAIN ANALYSIS
+# 15. MAIN ANALYSIS
 # ================================================================
 
 for outer_number, (
@@ -903,6 +881,10 @@ for outer_number, (
         "========================================"
     )
 
+
+    # ============================================================
+    # OUTER TRAIN / HELD-OUT TEST
+    # ============================================================
 
     X_train = X.iloc[
         train_idx
@@ -943,32 +925,6 @@ for outer_number, (
     )
 
 
-    # ============================================================
-    # CACHE
-    # ============================================================
-
-    split_cache = os.path.join(
-
-        CACHE_ROOT,
-
-        f"outer_{outer_number}"
-    )
-
-
-    memory = Memory(
-
-        location=
-            split_cache,
-
-        verbose=
-            0
-    )
-
-
-    # ============================================================
-    # BEST MODEL IN THIS REPETITION
-    # ============================================================
-
     best_inner_auc = -np.inf
 
     selected_k = None
@@ -977,33 +933,79 @@ for outer_number, (
 
 
     # ============================================================
-    # FEATURE COUNT LOOP: 3 -> 10
+    # TEST FEATURE COUNTS k = 3 ... 10
     # ============================================================
 
     for num_features in FEATURE_COUNTS:
 
 
         # ========================================================
+        # FIXED XGBOOST FEATURE SELECTOR
+        # ========================================================
+
+        xgb_selector = XGBClassifier(
+
+            objective=
+                "binary:logistic",
+
+            n_estimators=
+                XGB_SELECTOR_N_ESTIMATORS,
+
+            max_depth=
+                XGB_SELECTOR_MAX_DEPTH,
+
+            learning_rate=
+                XGB_SELECTOR_LEARNING_RATE,
+
+            subsample=
+                XGB_SELECTOR_SUBSAMPLE,
+
+            colsample_bytree=
+                XGB_SELECTOR_COLSAMPLE_BYTREE,
+
+            reg_alpha=
+                XGB_SELECTOR_REG_ALPHA,
+
+            reg_lambda=
+                XGB_SELECTOR_REG_LAMBDA,
+
+            importance_type=
+                XGB_SELECTOR_IMPORTANCE_TYPE,
+
+            eval_metric=
+                "logloss",
+
+            tree_method=
+                "hist",
+
+            random_state=
+                RANDOM_STATE,
+
+            n_jobs=
+                1
+        )
+
+
+        # ========================================================
         # PIPELINE
         #
         # Spearman correlation filtering
-        #        ↓
+        #             ↓
         # StandardScaler
-        #        ↓
+        #             ↓
         # XGBoost feature selector
-        #        ↓
-        # Logistic Regression classifier
+        #             ↓
+        # Top k features
+        #             ↓
+        # Random Forest classifier
         #
+        # Every data-dependent step is fitted within inner CV.
         # ========================================================
 
         pipeline = Pipeline(
 
             steps=[
 
-
-                # ------------------------------------------------
-                # CORRELATION FILTER
-                # ------------------------------------------------
 
                 (
                     "corr_filter",
@@ -1019,17 +1021,6 @@ for outer_number, (
                 ),
 
 
-                # ------------------------------------------------
-                # STANDARDIZATION
-                #
-                # XGBoost itself does not require scaling,
-                # but LR classifier does.
-                #
-                # Keeping scaler before the selector ensures that
-                # the selected variables passed to LR are already
-                # standardized.
-                # ------------------------------------------------
-
                 (
                     "scaler",
 
@@ -1037,58 +1028,13 @@ for outer_number, (
                 ),
 
 
-                # ------------------------------------------------
-                # FEATURE SELECTOR =
-                # XGBOOST
-                # ------------------------------------------------
-
                 (
                     "selector",
 
                     SelectFromModel(
 
                         estimator=
-                            XGBClassifier(
-
-                                objective=
-                                    "binary:logistic",
-
-                                n_estimators=
-                                    XGB_SELECTOR_N_ESTIMATORS,
-
-                                max_depth=
-                                    XGB_SELECTOR_MAX_DEPTH,
-
-                                learning_rate=
-                                    XGB_SELECTOR_LEARNING_RATE,
-
-                                subsample=
-                                    XGB_SELECTOR_SUBSAMPLE,
-
-                                colsample_bytree=
-                                    XGB_SELECTOR_COLSAMPLE_BYTREE,
-
-                                reg_alpha=
-                                    XGB_SELECTOR_REG_ALPHA,
-
-                                reg_lambda=
-                                    XGB_SELECTOR_REG_LAMBDA,
-
-                                importance_type=
-                                    XGB_SELECTOR_IMPORTANCE_TYPE,
-
-                                eval_metric=
-                                    "logloss",
-
-                                tree_method=
-                                    "hist",
-
-                                random_state=
-                                    RANDOM_STATE,
-
-                                n_jobs=
-                                    1
-                            ),
+                            xgb_selector,
 
                         threshold=
                             -np.inf,
@@ -1099,30 +1045,19 @@ for outer_number, (
                 ),
 
 
-                # ------------------------------------------------
-                # CLASSIFIER =
-                # LOGISTIC REGRESSION
-                # ------------------------------------------------
-
                 (
                     "classifier",
 
-                    LogisticRegression(
-
-                        solver=
-                            "liblinear",
-
-                        max_iter=
-                            5000,
+                    RandomForestClassifier(
 
                         random_state=
-                            RANDOM_STATE
+                            RANDOM_STATE,
+
+                        n_jobs=
+                            1
                     )
                 )
-            ],
-
-            memory=
-                memory
+            ]
         )
 
 
@@ -1138,17 +1073,17 @@ for outer_number, (
             param_grid=
                 param_grid,
 
-            cv=
-                inner_cv,
-
             scoring=
                 "roc_auc",
 
-            n_jobs=
-                -1,
+            cv=
+                inner_cv,
 
             refit=
                 True,
+
+            n_jobs=
+                -1,
 
             return_train_score=
                 False,
@@ -1162,14 +1097,7 @@ for outer_number, (
 
 
         # ========================================================
-        # FIT
-        #
-        # Correlation filtering,
-        # scaling,
-        # XGBoost feature selection,
-        # and LR hyperparameter optimization
-        #
-        # are all conducted within internal CV.
+        # FIT ONLY ON OUTER TRAINING SET
         # ========================================================
 
         grid_search.fit(
@@ -1181,22 +1109,24 @@ for outer_number, (
 
 
         current_inner_auc = (
+
             grid_search
             .best_score_
         )
 
 
         best_params_k = (
+
             grid_search
             .best_params_
         )
 
 
         # ========================================================
-        # RECORD RESULT FOR THIS k
+        # STORE RESULT FOR THIS k
         # ========================================================
 
-        k_record = {
+        k_search_results.append({
 
             "Outer_Repetition":
                 outer_number,
@@ -1207,14 +1137,21 @@ for outer_number, (
             "Best_Inner_CV_AUC":
                 current_inner_auc,
 
-            "Best_C":
+            "Best_n_estimators":
                 best_params_k[
-                    "classifier__C"
+                    "classifier__n_estimators"
                 ],
 
-            "Best_penalty":
+            "Best_max_depth":
+                str(
+                    best_params_k[
+                        "classifier__max_depth"
+                    ]
+                ),
+
+            "Best_min_samples_split":
                 best_params_k[
-                    "classifier__penalty"
+                    "classifier__min_samples_split"
                 ],
 
             "Best_class_weight":
@@ -1223,26 +1160,24 @@ for outer_number, (
                         "classifier__class_weight"
                     ]
                 )
-        }
-
-
-        k_search_results.append(
-            k_record
-        )
+        })
 
 
         print(
 
-            f"k={num_features}: "
+            f"k={num_features} | "
 
-            f"best inner AUC="
+            f"Inner AUC="
             f"{current_inner_auc:.3f} | "
 
-            f"C="
-            f"{best_params_k['classifier__C']} | "
+            f"n_estimators="
+            f"{best_params_k['classifier__n_estimators']} | "
 
-            f"penalty="
-            f"{best_params_k['classifier__penalty']} | "
+            f"max_depth="
+            f"{best_params_k['classifier__max_depth']} | "
+
+            f"min_samples_split="
+            f"{best_params_k['classifier__min_samples_split']} | "
 
             f"class_weight="
             f"{best_params_k['classifier__class_weight']}"
@@ -1250,9 +1185,9 @@ for outer_number, (
 
 
         # ========================================================
-        # SELECT BEST k USING ONLY INNER CV
+        # CHOOSE BEST k
         #
-        # Exact tie -> smaller k wins
+        # Exact tie -> smaller k remains selected
         # ========================================================
 
         if (
@@ -1279,27 +1214,23 @@ for outer_number, (
 
 
     # ============================================================
-    # 11. BEST PIPELINE REFITTED ON COMPLETE 85% TRAINING SET
-    # ============================================================
+    # 16. FINAL MODEL FOR THIS OUTER REPETITION
+    # ================================================================
     #
-    # Because GridSearchCV uses refit=True,
-    # selected_grid.best_estimator_ is already refitted
-    # on the complete outer training set using:
-    #
-    # - selected feature count
-    # - selected features
-    # - optimal LR hyperparameters
+    # GridSearchCV(refit=True) means that best_estimator_ has
+    # already been refitted on the complete outer training set.
     #
     # ============================================================
 
     best_model = (
+
         selected_grid
         .best_estimator_
     )
 
 
     # ============================================================
-    # HELD-OUT TEST PREDICTIONS
+    # 17. HELD-OUT TEST EVALUATION
     # ============================================================
 
     y_test_prob = (
@@ -1355,11 +1286,6 @@ for outer_number, (
     )
 
 
-    n_after_correlation = len(
-        corr_feature_names
-    )
-
-
     # ============================================================
     # SELECTED FEATURES
     # ============================================================
@@ -1377,7 +1303,6 @@ for outer_number, (
     selected_mask = (
 
         fitted_selector
-
         .get_support()
     )
 
@@ -1390,11 +1315,11 @@ for outer_number, (
     )
 
 
-    # ------------------------------------------------------------
-    # XGBoost gain importance
-    # ------------------------------------------------------------
+    # ============================================================
+    # XGBOOST GAIN IMPORTANCE
+    # ============================================================
 
-    selector_importance = (
+    xgb_importance = (
 
         fitted_selector
 
@@ -1406,21 +1331,18 @@ for outer_number, (
 
     selected_importance = (
 
-        selector_importance[
+        xgb_importance[
             selected_mask
         ]
     )
 
-
-    # ============================================================
-    # STORE SELECTED FEATURES
-    # ============================================================
 
     for feature_name, importance in zip(
 
         selected_feature_names,
 
         selected_importance
+
     ):
 
         selected_feature_records.append({
@@ -1434,16 +1356,17 @@ for outer_number, (
             "Feature":
                 feature_name,
 
-            "Selector_XGB_Gain_Importance":
+            "XGB_Gain_Importance":
                 importance
         })
 
 
     # ============================================================
-    # STORE CHOSEN LR PARAMETERS
+    # STORE CHOSEN RF HYPERPARAMETERS
     # ============================================================
 
     best_params = (
+
         selected_grid
         .best_params_
     )
@@ -1460,14 +1383,21 @@ for outer_number, (
         "Best_Inner_CV_AUC":
             best_inner_auc,
 
-        "C":
+        "n_estimators":
             best_params[
-                "classifier__C"
+                "classifier__n_estimators"
             ],
 
-        "penalty":
+        "max_depth":
+            str(
+                best_params[
+                    "classifier__max_depth"
+                ]
+            ),
+
+        "min_samples_split":
             best_params[
-                "classifier__penalty"
+                "classifier__min_samples_split"
             ],
 
         "class_weight":
@@ -1505,7 +1435,9 @@ for outer_number, (
             best_inner_auc,
 
         "Features_after_Correlation":
-            n_after_correlation,
+            len(
+                corr_feature_names
+            ),
 
         "Constant_Features_Removed":
             len(
@@ -1581,11 +1513,11 @@ for outer_number, (
 
 
     # ============================================================
-    # PRINT RESULT
+    # CURRENT REPETITION SUMMARY
     # ============================================================
 
     print(
-        "\nSelected feature count:",
+        "\nSelected k:",
         selected_k
     )
 
@@ -1611,7 +1543,7 @@ for outer_number, (
 
 
     print(
-        "Chosen LR parameters:",
+        "Best RF parameters:",
         best_params
     )
 
@@ -1678,31 +1610,10 @@ for outer_number, (
 
         os.path.join(
             OUTPUT_DIR,
-            "checkpoint_LR_hyperparameters.csv"
+            "checkpoint_RF_hyperparameters.csv"
         ),
 
         index=False
-    )
-
-
-    # ============================================================
-    # CLEAR SPLIT CACHE
-    # ============================================================
-
-    try:
-
-        memory.clear(
-            warn=False
-        )
-
-    except Exception:
-
-        pass
-
-
-    shutil.rmtree(
-        split_cache,
-        ignore_errors=True
     )
 
 
@@ -1710,11 +1621,9 @@ print(
     "\n========================================"
 )
 
-
 print(
     f"ALL {N_OUTER_SPLITS} REPETITIONS FINISHED"
 )
-
 
 print(
     "========================================"
@@ -1722,7 +1631,7 @@ print(
 
 
 # ================================================================
-# 12. CONVERT RESULTS TO DATAFRAMES
+# 18. DATAFRAMES
 # ================================================================
 
 outer_results_df = pd.DataFrame(
@@ -1751,7 +1660,14 @@ chosen_parameters_df = pd.DataFrame(
 
 
 # ================================================================
-# 13. PATIENT-LEVEL AGGREGATED HELD-OUT PREDICTIONS
+# 19. PATIENT-LEVEL AGGREGATION
+# ================================================================
+#
+# A patient may appear in multiple held-out sets.
+#
+# The final probability for that patient is the mean of all
+# probabilities obtained when that patient was held out.
+#
 # ================================================================
 
 patient_oof_df = (
@@ -1824,10 +1740,16 @@ if len(
     patient_oof_df
 ) != len(y):
 
-    raise ValueError(
+    print(
+        "\nWARNING: Not every patient appeared "
+        "in the held-out test sets."
+    )
 
-        "Not every patient appeared in a held-out "
-        "test set. Increase N_OUTER_SPLITS."
+    print(
+        "Patients with held-out predictions:",
+        len(patient_oof_df),
+        "/",
+        len(y)
     )
 
 
@@ -1868,7 +1790,7 @@ final_prob = (
 
 
 # ================================================================
-# 14. FINAL PATIENT-LEVEL PERFORMANCE
+# 20. FINAL PATIENT-LEVEL PERFORMANCE
 # ================================================================
 
 final_metrics = calculate_metrics(
@@ -1883,23 +1805,17 @@ final_metrics = calculate_metrics(
 
 
 # ================================================================
-# 15. PATIENT-LEVEL BOOTSTRAP 95% CI
+# 21. PATIENT-LEVEL BOOTSTRAP 95% CONFIDENCE INTERVALS
 # ================================================================
-
-rng = np.random.default_rng(
-    RANDOM_STATE
-)
-
 
 bootstrap_metrics = {
 
     metric: []
 
     for metric
-    in final_metrics.keys()
+    in final_metrics
 
     if metric not in [
-
         "TN",
         "FP",
         "FN",
@@ -1908,17 +1824,21 @@ bootstrap_metrics = {
 }
 
 
+rng = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
 n_patients = len(
     final_y
 )
 
 
-for bootstrap_number in range(
+for _ in range(
     N_BOOTSTRAP
 ):
 
-
-    bootstrap_idx = rng.choice(
+    idx = rng.choice(
 
         np.arange(
             n_patients
@@ -1933,15 +1853,16 @@ for bootstrap_number in range(
 
 
     y_boot = final_y[
-        bootstrap_idx
+        idx
     ]
 
 
-    prob_boot = final_prob[
-        bootstrap_idx
+    p_boot = final_prob[
+        idx
     ]
 
 
+    # Need both classes to calculate ROC-AUC
     if len(
         np.unique(
             y_boot
@@ -1951,11 +1872,11 @@ for bootstrap_number in range(
         continue
 
 
-    metrics_boot = calculate_metrics(
+    boot_result = calculate_metrics(
 
         y_boot,
 
-        prob_boot,
+        p_boot,
 
         threshold=
             CLASSIFICATION_THRESHOLD
@@ -1968,14 +1889,14 @@ for bootstrap_number in range(
             metric
         ].append(
 
-            metrics_boot[
+            boot_result[
                 metric
             ]
         )
 
 
 # ================================================================
-# PERFORMANCE 95% CI TABLE
+# PERFORMANCE TABLE WITH 95% CI
 # ================================================================
 
 performance_rows = []
@@ -1984,7 +1905,6 @@ performance_rows = []
 for metric, estimate in final_metrics.items():
 
     if metric in [
-
         "TN",
         "FP",
         "FN",
@@ -2030,7 +1950,7 @@ performance_ci_df = pd.DataFrame(
 
 
 # ================================================================
-# 16. CONFUSION MATRIX
+# 22. FINAL CONFUSION MATRIX
 # ================================================================
 
 final_predictions = (
@@ -2058,52 +1978,26 @@ confusion_df = pd.DataFrame({
 
     "Measure": [
 
-        "True Negative",
-
-        "False Positive",
-
-        "False Negative",
-
-        "True Positive",
-
-        "Total Patients",
-
-        "Class 0",
-
-        "Class 1",
-
+        "TN",
+        "FP",
+        "FN",
+        "TP",
         "Threshold"
     ],
 
     "Value": [
 
         tn,
-
         fp,
-
         fn,
-
         tp,
-
-        len(
-            final_y
-        ),
-
-        np.sum(
-            final_y == 0
-        ),
-
-        np.sum(
-            final_y == 1
-        ),
-
         CLASSIFICATION_THRESHOLD
     ]
 })
 
 
 # ================================================================
-# 17. FEATURE SELECTION FREQUENCY
+# 23. FEATURE SELECTION FREQUENCY
 # ================================================================
 
 feature_frequency_df = (
@@ -2117,23 +2011,17 @@ feature_frequency_df = (
     .agg(
 
         Selection_Frequency=(
-
             "Outer_Repetition",
-
             "nunique"
         ),
 
-        Mean_Selector_XGB_Gain=(
-
-            "Selector_XGB_Gain_Importance",
-
+        Mean_XGB_Gain=(
+            "XGB_Gain_Importance",
             "mean"
         ),
 
-        SD_Selector_XGB_Gain=(
-
-            "Selector_XGB_Gain_Importance",
-
+        SD_XGB_Gain=(
+            "XGB_Gain_Importance",
             "std"
         )
     )
@@ -2164,11 +2052,9 @@ feature_frequency_df = (
 
     .sort_values(
 
-        by=[
-
+        [
             "Selection_Frequency",
-
-            "Mean_Selector_XGB_Gain"
+            "Mean_XGB_Gain"
         ],
 
         ascending=[
@@ -2184,7 +2070,7 @@ feature_frequency_df = (
 
 
 # ================================================================
-# 18. FEATURE-COUNT SUMMARY
+# 24. FEATURE COUNT SUMMARY
 # ================================================================
 
 k_summary_df = (
@@ -2217,7 +2103,7 @@ k_summary_df = (
 )
 
 
-max_mean_inner_auc = (
+max_mean_auc = (
 
     k_summary_df[
         "Mean_Inner_CV_AUC"
@@ -2237,7 +2123,7 @@ global_best_k = int(
                 "Mean_Inner_CV_AUC"
             ],
 
-            max_mean_inner_auc
+            max_mean_auc
         ),
 
         "Num_Features"
@@ -2247,7 +2133,7 @@ global_best_k = int(
 
 
 k_summary_df[
-    "Best_By_Mean_Inner_CV"
+    "Global_Best_K"
 ] = (
 
     k_summary_df[
@@ -2260,10 +2146,10 @@ k_summary_df[
 
 
 # ================================================================
-# 19. FEATURE-COUNT SELECTION FREQUENCY
+# 25. FREQUENCY OF SELECTED k
 # ================================================================
 
-k_selection_frequency_df = (
+k_frequency_df = (
 
     outer_results_df[
         "Selected_K"
@@ -2284,11 +2170,11 @@ k_selection_frequency_df = (
 )
 
 
-k_selection_frequency_df[
+k_frequency_df[
     "Selection_Percent"
 ] = (
 
-    k_selection_frequency_df[
+    k_frequency_df[
         "Selection_Frequency"
     ]
 
@@ -2301,7 +2187,7 @@ k_selection_frequency_df[
 
 
 # ================================================================
-# 20. LR HYPERPARAMETER FREQUENCY
+# 26. RF HYPERPARAMETER FREQUENCY
 # ================================================================
 
 hyperparameter_frequency_df = (
@@ -2312,8 +2198,9 @@ hyperparameter_frequency_df = (
 
         [
             "Selected_K",
-            "C",
-            "penalty",
+            "n_estimators",
+            "max_depth",
+            "min_samples_split",
             "class_weight"
         ],
 
@@ -2338,87 +2225,7 @@ hyperparameter_frequency_df = (
 
 
 # ================================================================
-# 21. SPLIT PERFORMANCE SUMMARY
-# ================================================================
-
-split_metric_columns = [
-
-    "ROC_AUC",
-
-    "PR_AUC_AP",
-
-    "Accuracy",
-
-    "Balanced_Accuracy",
-
-    "Sensitivity",
-
-    "Specificity",
-
-    "Precision_PPV",
-
-    "NPV",
-
-    "F1",
-
-    "G_mean",
-
-    "Brier_Score"
-]
-
-
-split_summary_rows = []
-
-
-for metric in split_metric_columns:
-
-    values = outer_results_df[
-        metric
-    ].to_numpy()
-
-
-    split_summary_rows.append({
-
-        "Metric":
-            metric,
-
-        "Mean_across_splits":
-            np.mean(
-                values
-            ),
-
-        "SD_across_splits":
-            np.std(
-                values,
-                ddof=1
-            ),
-
-        "Median":
-            np.median(
-                values
-            ),
-
-        "2.5th_percentile":
-            np.percentile(
-                values,
-                2.5
-            ),
-
-        "97.5th_percentile":
-            np.percentile(
-                values,
-                97.5
-            )
-    })
-
-
-split_summary_df = pd.DataFrame(
-    split_summary_rows
-)
-
-
-# ================================================================
-# 22. ROC CURVE + 95% BOOTSTRAP BAND
+# 27. ROC CURVE + 95% BOOTSTRAP CONFIDENCE BAND
 # ================================================================
 
 fpr, tpr, roc_thresholds = roc_curve(
@@ -2429,7 +2236,7 @@ fpr, tpr, roc_thresholds = roc_curve(
 )
 
 
-roc_auc_final = roc_auc_score(
+final_auc = roc_auc_score(
 
     final_y,
 
@@ -2452,10 +2259,9 @@ rng_roc = np.random.default_rng(
 )
 
 
-for i in range(
+for _ in range(
     N_BOOTSTRAP
 ):
-
 
     idx = rng_roc.choice(
 
@@ -2543,7 +2349,7 @@ roc_upper = np.percentile(
 )
 
 
-auc_row = performance_ci_df[
+auc_row = performance_ci_df.loc[
 
     performance_ci_df[
         "Metric"
@@ -2553,16 +2359,6 @@ auc_row = performance_ci_df[
     "ROC_AUC"
 
 ].iloc[0]
-
-
-auc_ci_low = auc_row[
-    "95% CI Lower"
-]
-
-
-auc_ci_high = auc_row[
-    "95% CI Upper"
-]
 
 
 plt.figure(
@@ -2580,16 +2376,13 @@ plt.plot(
 
     label=(
 
-        "Repeated held-out predictions\n"
-
-        f"AUC = "
-        f"{roc_auc_final:.3f} "
+        f"AUC = {final_auc:.3f} "
 
         f"(95% CI "
 
-        f"{auc_ci_low:.3f}-"
+        f"{auc_row['95% CI Lower']:.3f}-"
 
-        f"{auc_ci_high:.3f})"
+        f"{auc_row['95% CI Upper']:.3f})"
     )
 )
 
@@ -2617,7 +2410,8 @@ plt.plot(
 
     linestyle="--",
 
-    label="Chance"
+    label=
+        "Chance"
 )
 
 
@@ -2632,19 +2426,7 @@ plt.ylabel(
 
 
 plt.title(
-    "ROC Curve - XGBoost Selector + LR Classifier"
-)
-
-
-plt.xlim(
-    0,
-    1
-)
-
-
-plt.ylim(
-    0,
-    1
+    "ROC Curve - XGBoost Selector + Random Forest"
 )
 
 
@@ -2656,17 +2438,12 @@ plt.legend(
 plt.tight_layout()
 
 
-ROC_FIGURE = os.path.join(
-
-    FIGURE_DIR,
-
-    "XGB_LR_ROC_Curve_95CI.png"
-)
-
-
 plt.savefig(
 
-    ROC_FIGURE,
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_RF_ROC_95CI.png"
+    ),
 
     dpi=300,
 
@@ -2704,11 +2481,10 @@ roc_band_df = pd.DataFrame({
 
 
 # ================================================================
-# 23. PRECISION-RECALL CURVE + 95% BOOTSTRAP BAND
+# 28. PRECISION-RECALL CURVE + 95% BOOTSTRAP BAND
 # ================================================================
 
-precision, recall, pr_thresholds = (
-
+precision, recall, _ = (
     precision_recall_curve(
 
         final_y,
@@ -2718,14 +2494,11 @@ precision, recall, pr_thresholds = (
 )
 
 
-average_precision = (
+final_ap = average_precision_score(
 
-    average_precision_score(
+    final_y,
 
-        final_y,
-
-        final_prob
-    )
+    final_prob
 )
 
 
@@ -2749,10 +2522,9 @@ rng_pr = np.random.default_rng(
 )
 
 
-for i in range(
+for _ in range(
     N_BOOTSTRAP
 ):
-
 
     idx = rng_pr.choice(
 
@@ -2788,7 +2560,6 @@ for i in range(
 
 
     precision_b, recall_b, _ = (
-
         precision_recall_curve(
 
             y_b,
@@ -2838,7 +2609,7 @@ pr_upper = np.percentile(
 )
 
 
-ap_row = performance_ci_df[
+ap_row = performance_ci_df.loc[
 
     performance_ci_df[
         "Metric"
@@ -2848,16 +2619,6 @@ ap_row = performance_ci_df[
     "PR_AUC_AP"
 
 ].iloc[0]
-
-
-ap_ci_low = ap_row[
-    "95% CI Lower"
-]
-
-
-ap_ci_high = ap_row[
-    "95% CI Upper"
-]
 
 
 plt.figure(
@@ -2875,16 +2636,13 @@ plt.plot(
 
     label=(
 
-        "Repeated held-out predictions\n"
-
-        f"AP = "
-        f"{average_precision:.3f} "
+        f"AP = {final_ap:.3f} "
 
         f"(95% CI "
 
-        f"{ap_ci_low:.3f}-"
+        f"{ap_row['95% CI Lower']:.3f}-"
 
-        f"{ap_ci_high:.3f})"
+        f"{ap_row['95% CI Upper']:.3f})"
     )
 )
 
@@ -2913,7 +2671,6 @@ plt.axhline(
     label=(
 
         f"Baseline prevalence = "
-
         f"{prevalence:.3f}"
     )
 )
@@ -2930,19 +2687,7 @@ plt.ylabel(
 
 
 plt.title(
-    "Precision-Recall Curve - XGBoost Selector + LR Classifier"
-)
-
-
-plt.xlim(
-    0,
-    1
-)
-
-
-plt.ylim(
-    0,
-    1
+    "Precision-Recall Curve - XGBoost Selector + Random Forest"
 )
 
 
@@ -2954,17 +2699,12 @@ plt.legend(
 plt.tight_layout()
 
 
-PR_FIGURE = os.path.join(
-
-    FIGURE_DIR,
-
-    "XGB_LR_PR_Curve_95CI.png"
-)
-
-
 plt.savefig(
 
-    PR_FIGURE,
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_RF_PR_95CI.png"
+    ),
 
     dpi=300,
 
@@ -2999,7 +2739,7 @@ pr_band_df = pd.DataFrame({
 
 
 # ================================================================
-# 24. CALIBRATION CURVE + BRIER SCORE
+# 29. CALIBRATION CURVE
 # ================================================================
 
 prob_true, prob_pred = calibration_curve(
@@ -3016,7 +2756,7 @@ prob_true, prob_pred = calibration_curve(
 )
 
 
-brier = brier_score_loss(
+final_brier = brier_score_loss(
 
     final_y,
 
@@ -3054,9 +2794,8 @@ plt.plot(
 
     label=(
 
-        "Repeated held-out predictions "
-
-        f"(Brier = {brier:.3f})"
+        f"Brier score = "
+        f"{final_brier:.3f}"
     )
 )
 
@@ -3067,24 +2806,12 @@ plt.xlabel(
 
 
 plt.ylabel(
-    "Observed proportion of positive cases"
+    "Observed positive proportion"
 )
 
 
 plt.title(
-    "Calibration Curve - XGBoost Selector + LR Classifier"
-)
-
-
-plt.xlim(
-    0,
-    1
-)
-
-
-plt.ylim(
-    0,
-    1
+    "Calibration - XGBoost Selector + Random Forest"
 )
 
 
@@ -3094,17 +2821,12 @@ plt.legend()
 plt.tight_layout()
 
 
-CALIBRATION_FIGURE = os.path.join(
-
-    FIGURE_DIR,
-
-    "XGB_LR_Calibration_Curve.png"
-)
-
-
 plt.savefig(
 
-    CALIBRATION_FIGURE,
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_RF_Calibration.png"
+    ),
 
     dpi=300,
 
@@ -3126,126 +2848,26 @@ calibration_df = pd.DataFrame({
 
 
 # ================================================================
-# 25. SEARCH GRID INFORMATION
-# ================================================================
-
-search_grid_df = pd.DataFrame({
-
-    "Component": [
-
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-        "Feature selector",
-
-        "Classifier",
-        "Classifier",
-        "Classifier"
-    ],
-
-    "Hyperparameter": [
-
-        "Number of selected features",
-
-        "XGB n_estimators",
-
-        "XGB max_depth",
-
-        "XGB learning_rate",
-
-        "XGB subsample",
-
-        "XGB colsample_bytree",
-
-        "XGB reg_alpha",
-
-        "XGB reg_lambda",
-
-        "LR C",
-
-        "LR penalty",
-
-        "LR class_weight"
-    ],
-
-    "Values searched": [
-
-        str(
-            FEATURE_COUNTS
-        ),
-
-        str(
-            [XGB_SELECTOR_N_ESTIMATORS]
-        ),
-
-        str(
-            [XGB_SELECTOR_MAX_DEPTH]
-        ),
-
-        str(
-            [XGB_SELECTOR_LEARNING_RATE]
-        ),
-
-        str(
-            [XGB_SELECTOR_SUBSAMPLE]
-        ),
-
-        str(
-            [XGB_SELECTOR_COLSAMPLE_BYTREE]
-        ),
-
-        str(
-            [XGB_SELECTOR_REG_ALPHA]
-        ),
-
-        str(
-            [XGB_SELECTOR_REG_LAMBDA]
-        ),
-
-        str(
-            param_grid[
-                "classifier__C"
-            ]
-        ),
-
-        str(
-            param_grid[
-                "classifier__penalty"
-            ]
-        ),
-
-        str(
-            param_grid[
-                "classifier__class_weight"
-            ]
-        )
-    ]
-})
-
-
-# ================================================================
-# 26. METHOD INFORMATION
+# 30. METHOD INFORMATION
 # ================================================================
 
 method_info_df = pd.DataFrame({
 
     "Item": [
 
-        "Patients",
+        "Number of patients",
 
-        "Initial features",
+        "Initial radiomics features",
 
-        "Outer evaluation",
+        "Outer validation",
 
         "Outer repetitions",
 
+        "Training fraction",
+
         "Test fraction",
 
-        "Inner validation",
+        "Internal CV",
 
         "Correlation method",
 
@@ -3255,7 +2877,7 @@ method_info_df = pd.DataFrame({
 
         "Feature selector",
 
-        "XGB importance type",
+        "XGBoost importance type",
 
         "XGB n_estimators",
 
@@ -3267,33 +2889,27 @@ method_info_df = pd.DataFrame({
 
         "XGB colsample_bytree",
 
-        "XGB reg_alpha",
-
-        "XGB reg_lambda",
-
-        "Feature counts assessed",
-
-        "Feature-count selection rule",
+        "Feature counts tested",
 
         "Classifier",
 
-        "LR C values",
+        "RF n_estimators",
 
-        "LR penalties",
+        "RF max_depth",
 
-        "LR class weights",
+        "RF min_samples_split",
 
-        "Tuning metric",
+        "RF class_weight",
+
+        "Optimization metric",
 
         "Classification threshold",
 
-        "Final patient-level probability",
+        "Patient-level aggregation",
 
         "Bootstrap repetitions",
 
-        "Random state",
-
-        "Global best k by mean inner-CV AUC"
+        "Global best feature count"
     ],
 
     "Value": [
@@ -3306,24 +2922,19 @@ method_info_df = pd.DataFrame({
 
         N_OUTER_SPLITS,
 
+        1 - TEST_SIZE,
+
         TEST_SIZE,
 
-        (
-            f"{INNER_FOLDS}-fold "
-            "StratifiedKFold "
-            "inside each training set"
-        ),
+        f"Stratified {INNER_FOLDS}-fold CV",
 
         "Spearman absolute correlation",
 
         CORRELATION_THRESHOLD,
 
-        "StandardScaler fitted inside CV",
+        "StandardScaler fitted within CV",
 
-        (
-            "XGBClassifier SelectFromModel "
-            "fitted inside CV"
-        ),
+        "XGBClassifier + SelectFromModel",
 
         XGB_SELECTOR_IMPORTANCE_TYPE,
 
@@ -3337,31 +2948,27 @@ method_info_df = pd.DataFrame({
 
         XGB_SELECTOR_COLSAMPLE_BYTREE,
 
-        XGB_SELECTOR_REG_ALPHA,
-
-        XGB_SELECTOR_REG_LAMBDA,
-
         str(
             FEATURE_COUNTS
         ),
 
-        (
-            "Highest mean inner-CV ROC-AUC "
-            "within each outer repetition; "
-            "smaller k in exact ties"
-        ),
-
-        "LogisticRegression",
+        "RandomForestClassifier",
 
         str(
             param_grid[
-                "classifier__C"
+                "classifier__n_estimators"
             ]
         ),
 
         str(
             param_grid[
-                "classifier__penalty"
+                "classifier__max_depth"
+            ]
+        ),
+
+        str(
+            param_grid[
+                "classifier__min_samples_split"
             ]
         ),
 
@@ -3376,14 +2983,11 @@ method_info_df = pd.DataFrame({
         CLASSIFICATION_THRESHOLD,
 
         (
-            "Mean of each patient's probabilities "
-            "from all repetitions in which that "
-            "patient was held out"
+            "Mean held-out probability "
+            "for each patient"
         ),
 
         N_BOOTSTRAP,
-
-        RANDOM_STATE,
 
         global_best_k
     ]
@@ -3391,14 +2995,14 @@ method_info_df = pd.DataFrame({
 
 
 # ================================================================
-# 27. SAVE COMPLETE EXCEL WORKBOOK
+# 31. SAVE COMPLETE EXCEL WORKBOOK
 # ================================================================
 
 FINAL_EXCEL = os.path.join(
 
     OUTPUT_DIR,
 
-    "XGB_LR_Final_Results.xlsx"
+    "XGB_RF_Final_Results.xlsx"
 )
 
 
@@ -3406,9 +3010,7 @@ with pd.ExcelWriter(
 
     FINAL_EXCEL,
 
-    engine="openpyxl",
-
-    mode="w"
+    engine="openpyxl"
 
 ) as writer:
 
@@ -3457,23 +3059,12 @@ with pd.ExcelWriter(
     )
 
 
-    split_summary_df.to_excel(
-
-        writer,
-
-        sheet_name=
-            "Split_Summary",
-
-        index=False
-    )
-
-
     k_results_df.to_excel(
 
         writer,
 
         sheet_name=
-            "K_InnerCV_Results",
+            "K_InnerCV",
 
         index=False
     )
@@ -3490,7 +3081,7 @@ with pd.ExcelWriter(
     )
 
 
-    k_selection_frequency_df.to_excel(
+    k_frequency_df.to_excel(
 
         writer,
 
@@ -3528,7 +3119,7 @@ with pd.ExcelWriter(
         writer,
 
         sheet_name=
-            "Chosen_LR_Hyperparams",
+            "Chosen_RF_Params",
 
         index=False
     )
@@ -3550,18 +3141,7 @@ with pd.ExcelWriter(
         writer,
 
         sheet_name=
-            "All_HeldOut_Preds",
-
-        index=False
-    )
-
-
-    search_grid_df.to_excel(
-
-        writer,
-
-        sheet_name=
-            "Search_Grid",
+            "HeldOut_Predictions",
 
         index=False
     )
@@ -3616,7 +3196,7 @@ with pd.ExcelWriter(
         writer,
 
         sheet_name=
-            "Calibration_Data",
+            "Calibration",
 
         index=False
     )
@@ -3634,7 +3214,7 @@ with pd.ExcelWriter(
 
 
 # ================================================================
-# 28. FINAL PRINT
+# 32. FINAL OUTPUT
 # ================================================================
 
 print(
@@ -3643,12 +3223,7 @@ print(
 
 
 print(
-    "FINAL PATIENT-LEVEL PERFORMANCE"
-)
-
-
-print(
-    "XGBOOST SELECTOR + LR CLASSIFIER"
+    "FINAL XGBOOST SELECTOR + RANDOM FOREST"
 )
 
 
@@ -3670,30 +3245,44 @@ print(
 
 
 print(
-    "\nConfusion matrix:"
+    "\nConfusion Matrix:"
 )
 
 
 print(
 
     f"TN={tn}, "
-
     f"FP={fp}, "
-
     f"FN={fn}, "
-
     f"TP={tp}"
 )
 
 
 print(
-    "\nGlobal best feature count "
-    "based ONLY on mean inner-CV AUC:"
+    "\nGlobal best number of features "
+    "based on mean inner-CV AUC:"
 )
 
 
 print(
     global_best_k
+)
+
+
+print(
+    "\nFeature-count summary:"
+)
+
+
+print(
+
+    k_summary_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
 )
 
 
@@ -3704,7 +3293,7 @@ print(
 
 print(
 
-    k_selection_frequency_df
+    k_frequency_df
 
     .to_string(
         index=False
@@ -3713,8 +3302,7 @@ print(
 
 
 print(
-    "\nMost frequently selected "
-    "LR classifier hyperparameters:"
+    "\nMost frequently selected RF parameters:"
 )
 
 
@@ -3731,7 +3319,7 @@ print(
 
 
 print(
-    "\nMost frequently selected XGBoost features:"
+    "\nMost frequently selected features:"
 )
 
 
@@ -3740,6 +3328,8 @@ print(
     feature_frequency_df
 
     .head(20)
+
+    .round(4)
 
     .to_string(
         index=False
@@ -3764,18 +3354,6 @@ print(
 
 print(
     FIGURE_DIR
-)
-
-
-# ================================================================
-# 29. CLEAN CACHE
-# ================================================================
-
-shutil.rmtree(
-
-    CACHE_ROOT,
-
-    ignore_errors=True
 )
 
 
