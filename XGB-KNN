@@ -1,0 +1,9584 @@
+# ================================================================
+# XGBOOST FEATURE SELECTOR -> KNN CLASSIFIER
+#
+# 50 repeated stratified holdout splits
+# 85% training / 15% held-out test
+# Internal stratified 5-fold CV
+# Correlation filtering inside CV
+# Feature counts: 3-10
+# ================================================================
+
+
+# ================================================================
+# 1. IMPORTS
+# ================================================================
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, TransformerMixin
+
+from sklearn.model_selection import (
+    StratifiedShuffleSplit,
+    StratifiedKFold,
+    GridSearchCV,
+    ParameterGrid
+)
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectFromModel
+
+# Feature selector
+from xgboost import XGBClassifier
+
+# Classifier
+from sklearn.neighbors import KNeighborsClassifier
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    brier_score_loss,
+    roc_curve,
+    precision_recall_curve
+)
+
+from sklearn.calibration import calibration_curve
+
+
+warnings.filterwarnings("ignore")
+
+
+# ================================================================
+# 2. USER SETTINGS
+# ================================================================
+
+INPUT_FILE = (
+    r"C:\Users\zaman\Downloads\radiomics_features_BW25.xlsx"
+)
+
+LABEL_COL = "label"
+
+ID_COL = None
+
+
+# ================================================================
+# 3. VALIDATION SETTINGS
+# ================================================================
+
+N_OUTER_SPLITS = 50
+
+TEST_SIZE = 0.15
+
+INNER_FOLDS = 5
+
+FEATURE_COUNTS = list(
+    range(3, 11)
+)
+
+CORRELATION_THRESHOLD = 0.90
+
+CLASSIFICATION_THRESHOLD = 0.50
+
+RANDOM_STATE = 42
+
+N_BOOTSTRAP = 5000
+
+
+# ================================================================
+# 4. FIXED XGBOOST FEATURE SELECTOR SETTINGS
+# ================================================================
+#
+# Keep these IDENTICAL for all classifiers when XGBoost
+# is used as the feature selector.
+#
+# ================================================================
+
+XGB_SELECTOR_N_ESTIMATORS = 100
+
+XGB_SELECTOR_MAX_DEPTH = 3
+
+XGB_SELECTOR_LEARNING_RATE = 0.05
+
+XGB_SELECTOR_SUBSAMPLE = 0.80
+
+XGB_SELECTOR_COLSAMPLE_BYTREE = 0.80
+
+XGB_SELECTOR_REG_ALPHA = 0.0
+
+XGB_SELECTOR_REG_LAMBDA = 1.0
+
+XGB_SELECTOR_IMPORTANCE_TYPE = "gain"
+
+
+# ================================================================
+# 5. OUTPUT
+# ================================================================
+
+desktop = os.path.join(
+    os.path.expanduser("~"),
+    "Desktop"
+)
+
+
+OUTPUT_DIR = os.path.join(
+    desktop,
+    "XGB_KNN_Revised_Results"
+)
+
+
+FIGURE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "Figures"
+)
+
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+
+os.makedirs(
+    FIGURE_DIR,
+    exist_ok=True
+)
+
+
+# ================================================================
+# 6. CORRELATION FILTER
+# ================================================================
+
+class CorrelationFilter(
+    BaseEstimator,
+    TransformerMixin
+):
+
+    def __init__(
+        self,
+        threshold=0.90,
+        method="spearman"
+    ):
+
+        self.threshold = threshold
+        self.method = method
+
+
+    def fit(
+        self,
+        X,
+        y=None
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+
+            X = pd.DataFrame(X)
+
+
+        self.feature_names_in_ = np.asarray(
+            X.columns
+        )
+
+
+        # --------------------------------------------------------
+        # Remove constant features
+        # --------------------------------------------------------
+
+        nunique = X.nunique(
+            dropna=False
+        )
+
+
+        self.constant_features_ = list(
+
+            nunique[
+                nunique <= 1
+            ].index
+        )
+
+
+        X_temp = X.drop(
+
+            columns=self.constant_features_,
+
+            errors="ignore"
+        )
+
+
+        # --------------------------------------------------------
+        # Spearman correlation
+        # --------------------------------------------------------
+
+        corr = X_temp.corr(
+            method=self.method
+        ).abs()
+
+
+        upper = corr.where(
+
+            np.triu(
+
+                np.ones(
+                    corr.shape
+                ),
+
+                k=1
+
+            ).astype(bool)
+        )
+
+
+        self.correlated_features_ = [
+
+            column
+
+            for column in upper.columns
+
+            if (
+
+                upper[column]
+                >
+                self.threshold
+
+            ).any()
+        ]
+
+
+        self.features_to_keep_ = [
+
+            column
+
+            for column in X_temp.columns
+
+            if column
+            not in self.correlated_features_
+        ]
+
+
+        return self
+
+
+    def transform(
+        self,
+        X
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+
+            X = pd.DataFrame(
+
+                X,
+
+                columns=
+                    self.feature_names_in_
+            )
+
+
+        return X[
+            self.features_to_keep_
+        ].copy()
+
+
+    def get_feature_names_out(
+        self,
+        input_features=None
+    ):
+
+        return np.asarray(
+            self.features_to_keep_
+        )
+
+
+# ================================================================
+# 7. LOAD DATA
+# ================================================================
+
+df = pd.read_excel(
+    INPUT_FILE
+)
+
+
+df.columns = (
+
+    df.columns
+
+    .astype(str)
+
+    .str.strip()
+)
+
+
+# ================================================================
+# 8. FIND LABEL COLUMN
+# ================================================================
+
+if LABEL_COL not in df.columns:
+
+    possible_labels = [
+
+        "label",
+        "Label",
+        "Outcome",
+        "outcome"
+    ]
+
+
+    found_labels = [
+
+        c
+
+        for c in possible_labels
+
+        if c in df.columns
+    ]
+
+
+    if len(
+        found_labels
+    ) == 0:
+
+        raise ValueError(
+            "Label column not found."
+        )
+
+
+    LABEL_COL = found_labels[0]
+
+
+# ================================================================
+# 9. FIND PATIENT ID COLUMN
+# ================================================================
+
+if ID_COL is None:
+
+    possible_ids = [
+
+        "PatientID",
+        "patient_id",
+        "Image",
+        "ID"
+    ]
+
+
+    found_ids = [
+
+        c
+
+        for c in possible_ids
+
+        if c in df.columns
+    ]
+
+
+    if len(
+        found_ids
+    ) > 0:
+
+        ID_COL = found_ids[0]
+
+    else:
+
+        ID_COL = "RowID"
+
+        df[ID_COL] = np.arange(
+            len(df)
+        )
+
+
+# ================================================================
+# 10. LABEL AND PATIENT IDs
+# ================================================================
+
+y = (
+
+    df[LABEL_COL]
+
+    .astype(int)
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+patient_ids = (
+
+    df[ID_COL]
+
+    .astype(str)
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 11. REMOVE METADATA
+# ================================================================
+
+metadata_cols = [
+
+    LABEL_COL,
+
+    ID_COL,
+
+    "PatientID",
+    "patient_id",
+    "ID",
+    "RowID",
+
+    "Image",
+    "ImageFile",
+
+    "MaskFile",
+    "MaskLabel",
+
+    "ROIVoxels",
+
+    "label",
+    "Label",
+    "Outcome",
+    "outcome"
+]
+
+
+X = df.drop(
+
+    columns=
+        metadata_cols,
+
+    errors=
+        "ignore"
+)
+
+
+# ================================================================
+# KEEP ONLY NUMERIC FEATURES
+# ================================================================
+
+non_numeric_columns = (
+
+    X.select_dtypes(
+        exclude=[np.number]
+    )
+
+    .columns
+
+    .tolist()
+)
+
+
+if len(
+    non_numeric_columns
+) > 0:
+
+    print(
+        "Dropping non-numeric columns:",
+        non_numeric_columns
+    )
+
+
+    X = X.drop(
+        columns=
+            non_numeric_columns
+    )
+
+
+X = X.reset_index(
+    drop=True
+)
+
+
+# ================================================================
+# SAFETY CHECKS
+# ================================================================
+
+if X.isna().any().any():
+
+    raise ValueError(
+        "Missing values found in feature matrix."
+    )
+
+
+if np.isinf(
+    X.to_numpy()
+).any():
+
+    raise ValueError(
+        "Infinite values found in feature matrix."
+    )
+
+
+if set(
+    np.unique(y)
+) != {0, 1}:
+
+    raise ValueError(
+        "Outcome must contain only 0 and 1."
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    "DATASET"
+)
+
+print(
+    "========================================"
+)
+
+
+print(
+    "Patients:",
+    len(y)
+)
+
+
+print(
+    "Radiomics features:",
+    X.shape[1]
+)
+
+
+print(
+    "\nClass distribution:"
+)
+
+
+print(
+    y.value_counts().sort_index()
+)
+
+
+# ================================================================
+# 12. KNN HYPERPARAMETER GRID
+# ================================================================
+#
+# n_neighbors:
+#     3, 5, 7, 9, 11, 13, 15
+#
+# weights:
+#     uniform, distance
+#
+# p:
+#     1 = Manhattan
+#     2 = Euclidean
+#
+# Total:
+# 7 × 2 × 2 = 28 combinations
+#
+# ================================================================
+
+param_grid = {
+
+    "classifier__n_neighbors": [
+
+        3,
+        5,
+        7,
+        9,
+        11,
+        13,
+        15
+    ],
+
+    "classifier__weights": [
+
+        "uniform",
+        "distance"
+    ],
+
+    "classifier__p": [
+
+        1,
+        2
+    ]
+}
+
+
+print(
+    "\nKNN hyperparameter combinations:",
+    len(
+        list(
+            ParameterGrid(
+                param_grid
+            )
+        )
+    )
+)
+
+
+# ================================================================
+# 13. METRIC FUNCTION
+# ================================================================
+
+def calculate_metrics(
+    y_true,
+    probabilities,
+    threshold=0.50
+):
+
+    y_true = np.asarray(
+        y_true
+    ).astype(int)
+
+
+    probabilities = np.asarray(
+        probabilities
+    ).astype(float)
+
+
+    predictions = (
+
+        probabilities
+        >=
+        threshold
+
+    ).astype(int)
+
+
+    tn, fp, fn, tp = confusion_matrix(
+
+        y_true,
+
+        predictions,
+
+        labels=[0, 1]
+
+    ).ravel()
+
+
+    sensitivity = recall_score(
+
+        y_true,
+
+        predictions,
+
+        pos_label=1,
+
+        zero_division=0
+    )
+
+
+    specificity = recall_score(
+
+        y_true,
+
+        predictions,
+
+        pos_label=0,
+
+        zero_division=0
+    )
+
+
+    precision = precision_score(
+
+        y_true,
+
+        predictions,
+
+        zero_division=0
+    )
+
+
+    npv = (
+
+        tn / (tn + fn)
+
+        if (tn + fn) > 0
+
+        else 0
+    )
+
+
+    gmean = np.sqrt(
+
+        sensitivity
+        *
+        specificity
+    )
+
+
+    return {
+
+        "ROC_AUC":
+            roc_auc_score(
+                y_true,
+                probabilities
+            ),
+
+        "PR_AUC_AP":
+            average_precision_score(
+                y_true,
+                probabilities
+            ),
+
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Balanced_Accuracy":
+            balanced_accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Sensitivity":
+            sensitivity,
+
+        "Specificity":
+            specificity,
+
+        "Precision_PPV":
+            precision,
+
+        "NPV":
+            npv,
+
+        "F1":
+            f1_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "G_mean":
+            gmean,
+
+        "Brier_Score":
+            brier_score_loss(
+                y_true,
+                probabilities
+            ),
+
+        "TN":
+            tn,
+
+        "FP":
+            fp,
+
+        "FN":
+            fn,
+
+        "TP":
+            tp
+    }
+
+
+# ================================================================
+# 14. REPEATED STRATIFIED HOLDOUT
+# ================================================================
+
+outer_splitter = StratifiedShuffleSplit(
+
+    n_splits=
+        N_OUTER_SPLITS,
+
+    test_size=
+        TEST_SIZE,
+
+    random_state=
+        RANDOM_STATE
+)
+
+
+# ================================================================
+# STORAGE
+# ================================================================
+
+outer_results = []
+
+k_search_results = []
+
+test_prediction_records = []
+
+selected_feature_records = []
+
+chosen_parameter_records = []
+
+
+# ================================================================
+# 15. MAIN ANALYSIS
+# ================================================================
+
+for outer_number, (
+    train_idx,
+    test_idx
+) in enumerate(
+
+    outer_splitter.split(
+        X,
+        y
+    ),
+
+    start=1
+):
+
+
+    print(
+        "\n========================================"
+    )
+
+
+    print(
+        f"Outer repetition "
+        f"{outer_number}/"
+        f"{N_OUTER_SPLITS}"
+    )
+
+
+    print(
+        "========================================"
+    )
+
+
+    # ------------------------------------------------------------
+    # 85% training
+    # 15% completely held-out test
+    # ------------------------------------------------------------
+
+    X_train = X.iloc[
+        train_idx
+    ].copy()
+
+
+    X_test = X.iloc[
+        test_idx
+    ].copy()
+
+
+    y_train = y.iloc[
+        train_idx
+    ].copy()
+
+
+    y_test = y.iloc[
+        test_idx
+    ].copy()
+
+
+    # ============================================================
+    # INNER STRATIFIED 5-FOLD CV
+    # ============================================================
+
+    inner_cv = StratifiedKFold(
+
+        n_splits=
+            INNER_FOLDS,
+
+        shuffle=
+            True,
+
+        random_state=
+            RANDOM_STATE
+            +
+            outer_number
+    )
+
+
+    # ============================================================
+    # BEST CONFIGURATION IN THIS REPETITION
+    # ============================================================
+
+    best_inner_auc = -np.inf
+
+    selected_k = None
+
+    selected_grid = None
+
+
+    # ============================================================
+    # FEATURE COUNT LOOP: 3 -> 10
+    # ============================================================
+
+    for num_features in FEATURE_COUNTS:
+
+
+        # ========================================================
+        # FIXED XGBOOST FEATURE SELECTOR
+        # ========================================================
+
+        xgb_selector = XGBClassifier(
+
+            objective=
+                "binary:logistic",
+
+            n_estimators=
+                XGB_SELECTOR_N_ESTIMATORS,
+
+            max_depth=
+                XGB_SELECTOR_MAX_DEPTH,
+
+            learning_rate=
+                XGB_SELECTOR_LEARNING_RATE,
+
+            subsample=
+                XGB_SELECTOR_SUBSAMPLE,
+
+            colsample_bytree=
+                XGB_SELECTOR_COLSAMPLE_BYTREE,
+
+            reg_alpha=
+                XGB_SELECTOR_REG_ALPHA,
+
+            reg_lambda=
+                XGB_SELECTOR_REG_LAMBDA,
+
+            importance_type=
+                XGB_SELECTOR_IMPORTANCE_TYPE,
+
+            eval_metric=
+                "logloss",
+
+            tree_method=
+                "hist",
+
+            random_state=
+                RANDOM_STATE,
+
+            n_jobs=
+                1
+        )
+
+
+        # ========================================================
+        # PIPELINE
+        #
+        # Spearman correlation filter
+        #        ↓
+        # StandardScaler
+        #        ↓
+        # XGBoost feature selector
+        #        ↓
+        # Top k features
+        #        ↓
+        # KNN classifier
+        #
+        # ALL FITTED WITHIN INNER CV
+        # ========================================================
+
+        pipeline = Pipeline(
+
+            steps=[
+
+
+                (
+                    "corr_filter",
+
+                    CorrelationFilter(
+
+                        threshold=
+                            CORRELATION_THRESHOLD,
+
+                        method=
+                            "spearman"
+                    )
+                ),
+
+
+                # ------------------------------------------------
+                # Essential for KNN because KNN is distance based
+                # ------------------------------------------------
+
+                (
+                    "scaler",
+
+                    StandardScaler()
+                ),
+
+
+                (
+                    "selector",
+
+                    SelectFromModel(
+
+                        estimator=
+                            xgb_selector,
+
+                        threshold=
+                            -np.inf,
+
+                        max_features=
+                            num_features
+                    )
+                ),
+
+
+                (
+                    "classifier",
+
+                    KNeighborsClassifier(
+                        algorithm="auto"
+                    )
+                )
+            ]
+        )
+
+
+        # ========================================================
+        # GRID SEARCH
+        # ========================================================
+
+        grid_search = GridSearchCV(
+
+            estimator=
+                pipeline,
+
+            param_grid=
+                param_grid,
+
+            scoring=
+                "roc_auc",
+
+            cv=
+                inner_cv,
+
+            refit=
+                True,
+
+            n_jobs=
+                -1,
+
+            return_train_score=
+                False,
+
+            error_score=
+                "raise",
+
+            verbose=
+                0
+        )
+
+
+        # ========================================================
+        # FIT ONLY ON OUTER TRAINING SET
+        # ========================================================
+
+        grid_search.fit(
+
+            X_train,
+
+            y_train
+        )
+
+
+        current_inner_auc = (
+
+            grid_search
+            .best_score_
+        )
+
+
+        best_params_k = (
+
+            grid_search
+            .best_params_
+        )
+
+
+        # ========================================================
+        # SAVE RESULT FOR THIS k
+        # ========================================================
+
+        k_search_results.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Num_Features":
+                num_features,
+
+            "Best_Inner_CV_AUC":
+                current_inner_auc,
+
+            "Best_n_neighbors":
+                best_params_k[
+                    "classifier__n_neighbors"
+                ],
+
+            "Best_weights":
+                best_params_k[
+                    "classifier__weights"
+                ],
+
+            "Best_p":
+                best_params_k[
+                    "classifier__p"
+                ]
+        })
+
+
+        print(
+
+            f"k={num_features} | "
+
+            f"Inner AUC="
+            f"{current_inner_auc:.3f} | "
+
+            f"neighbors="
+            f"{best_params_k['classifier__n_neighbors']} | "
+
+            f"weights="
+            f"{best_params_k['classifier__weights']} | "
+
+            f"p="
+            f"{best_params_k['classifier__p']}"
+        )
+
+
+        # ========================================================
+        # SELECT BEST k BY INNER CV AUC
+        #
+        # Exact tie -> smaller k wins
+        # ========================================================
+
+        if (
+
+            current_inner_auc
+            >
+            best_inner_auc
+            +
+            1e-12
+
+        ):
+
+            best_inner_auc = (
+                current_inner_auc
+            )
+
+            selected_k = (
+                num_features
+            )
+
+            selected_grid = (
+                grid_search
+            )
+
+
+    # ============================================================
+    # 16. FINAL MODEL FOR THIS REPETITION
+    # ============================================================
+    #
+    # GridSearchCV(refit=True) means that this pipeline
+    # has already been refitted on the complete 85% training set
+    # using:
+    #
+    # - selected k
+    # - selected features
+    # - optimal KNN hyperparameters
+    #
+    # ============================================================
+
+    best_model = (
+
+        selected_grid
+        .best_estimator_
+    )
+
+
+    # ============================================================
+    # 17. HELD-OUT TEST EVALUATION
+    # ============================================================
+
+    y_test_prob = (
+
+        best_model
+
+        .predict_proba(
+            X_test
+        )[:, 1]
+    )
+
+
+    y_test_pred = (
+
+        y_test_prob
+
+        >=
+        CLASSIFICATION_THRESHOLD
+
+    ).astype(int)
+
+
+    test_metrics = calculate_metrics(
+
+        y_test,
+
+        y_test_prob,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    # ============================================================
+    # CORRELATION FILTER INFORMATION
+    # ============================================================
+
+    fitted_corr_filter = (
+
+        best_model
+
+        .named_steps[
+            "corr_filter"
+        ]
+    )
+
+
+    corr_feature_names = (
+
+        fitted_corr_filter
+
+        .get_feature_names_out()
+    )
+
+
+    # ============================================================
+    # SELECTED FEATURES
+    # ============================================================
+
+    fitted_selector = (
+
+        best_model
+
+        .named_steps[
+            "selector"
+        ]
+    )
+
+
+    selected_mask = (
+
+        fitted_selector
+
+        .get_support()
+    )
+
+
+    selected_feature_names = (
+
+        corr_feature_names[
+            selected_mask
+        ]
+    )
+
+
+    # ============================================================
+    # XGBOOST GAIN IMPORTANCE
+    # ============================================================
+
+    xgb_importance = (
+
+        fitted_selector
+
+        .estimator_
+
+        .feature_importances_
+    )
+
+
+    selected_importance = (
+
+        xgb_importance[
+            selected_mask
+        ]
+    )
+
+
+    for feature_name, importance in zip(
+
+        selected_feature_names,
+
+        selected_importance
+
+    ):
+
+        selected_feature_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Selected_K":
+                selected_k,
+
+            "Feature":
+                feature_name,
+
+            "XGB_Gain_Importance":
+                importance
+        })
+
+
+    # ============================================================
+    # STORE CHOSEN KNN PARAMETERS
+    # ============================================================
+
+    best_params = (
+
+        selected_grid
+        .best_params_
+    )
+
+
+    chosen_parameter_records.append({
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "n_neighbors":
+            best_params[
+                "classifier__n_neighbors"
+            ],
+
+        "weights":
+            best_params[
+                "classifier__weights"
+            ],
+
+        "p":
+            best_params[
+                "classifier__p"
+            ]
+    })
+
+
+    # ============================================================
+    # STORE OUTER PERFORMANCE
+    # ============================================================
+
+    outer_record = {
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Train_n":
+            len(
+                train_idx
+            ),
+
+        "Test_n":
+            len(
+                test_idx
+            ),
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "Features_after_Correlation":
+            len(
+                corr_feature_names
+            ),
+
+        "Constant_Features_Removed":
+            len(
+                fitted_corr_filter
+                .constant_features_
+            ),
+
+        "Correlated_Features_Removed":
+            len(
+                fitted_corr_filter
+                .correlated_features_
+            )
+    }
+
+
+    outer_record.update(
+        test_metrics
+    )
+
+
+    outer_results.append(
+        outer_record
+    )
+
+
+    # ============================================================
+    # STORE HELD-OUT PATIENT PREDICTIONS
+    # ============================================================
+
+    for local_position, row_index in enumerate(
+        test_idx
+    ):
+
+        test_prediction_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Row_Index":
+                int(
+                    row_index
+                ),
+
+            "PatientID":
+                patient_ids.iloc[
+                    row_index
+                ],
+
+            "True_Label":
+                int(
+                    y.iloc[
+                        row_index
+                    ]
+                ),
+
+            "Test_Probability":
+                float(
+                    y_test_prob[
+                        local_position
+                    ]
+                ),
+
+            "Test_Prediction":
+                int(
+                    y_test_pred[
+                        local_position
+                    ]
+                ),
+
+            "Selected_K":
+                selected_k
+        })
+
+
+    # ============================================================
+    # CURRENT REPETITION RESULT
+    # ============================================================
+
+    print(
+        "\nSelected k:",
+        selected_k
+    )
+
+
+    print(
+        "Best inner CV AUC:",
+        round(
+            best_inner_auc,
+            3
+        )
+    )
+
+
+    print(
+        "Held-out test AUC:",
+        round(
+            test_metrics[
+                "ROC_AUC"
+            ],
+            3
+        )
+    )
+
+
+    print(
+        "Best KNN parameters:",
+        best_params
+    )
+
+
+    # ============================================================
+    # CHECKPOINTS
+    # ============================================================
+
+    pd.DataFrame(
+        outer_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_outer_results.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        k_search_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_k_search.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        test_prediction_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_test_predictions.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        selected_feature_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_selected_features.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        chosen_parameter_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_KNN_hyperparameters.csv"
+        ),
+
+        index=False
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    f"ALL {N_OUTER_SPLITS} REPETITIONS FINISHED"
+)
+
+print(
+    "========================================"
+)
+
+
+# ================================================================
+# 18. DATAFRAMES
+# ================================================================
+
+outer_results_df = pd.DataFrame(
+    outer_results
+)
+
+
+k_results_df = pd.DataFrame(
+    k_search_results
+)
+
+
+test_predictions_df = pd.DataFrame(
+    test_prediction_records
+)
+
+
+selected_features_df = pd.DataFrame(
+    selected_feature_records
+)
+
+
+chosen_parameters_df = pd.DataFrame(
+    chosen_parameter_records
+)
+
+
+# ================================================================
+# 19. PATIENT-LEVEL AGGREGATED HELD-OUT PREDICTIONS
+# ================================================================
+
+patient_oof_df = (
+
+    test_predictions_df
+
+    .groupby(
+        "Row_Index"
+    )
+
+    .agg(
+
+        PatientID=(
+            "PatientID",
+            "first"
+        ),
+
+        True_Label=(
+            "True_Label",
+            "first"
+        ),
+
+        Mean_OOF_Probability=(
+            "Test_Probability",
+            "mean"
+        ),
+
+        SD_OOF_Probability=(
+            "Test_Probability",
+            "std"
+        ),
+
+        Test_Appearances=(
+            "Test_Probability",
+            "size"
+        )
+    )
+
+    .reset_index()
+)
+
+
+patient_oof_df[
+    "SD_OOF_Probability"
+] = (
+
+    patient_oof_df[
+        "SD_OOF_Probability"
+    ]
+
+    .fillna(0)
+)
+
+
+patient_oof_df[
+    "OOF_Prediction"
+] = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+if len(
+    patient_oof_df
+) != len(y):
+
+    print(
+        "\nWARNING: Not every patient appeared "
+        "in the held-out test set."
+    )
+
+    print(
+        "Patients with predictions:",
+        len(patient_oof_df),
+        "/",
+        len(y)
+    )
+
+
+patient_oof_df = (
+
+    patient_oof_df
+
+    .sort_values(
+        "Row_Index"
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+final_y = (
+
+    patient_oof_df[
+        "True_Label"
+    ]
+
+    .to_numpy()
+
+    .astype(int)
+)
+
+
+final_prob = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    .to_numpy()
+)
+
+
+# ================================================================
+# 20. FINAL PATIENT-LEVEL PERFORMANCE
+# ================================================================
+
+final_metrics = calculate_metrics(
+
+    final_y,
+
+    final_prob,
+
+    threshold=
+        CLASSIFICATION_THRESHOLD
+)
+
+
+# ================================================================
+# 21. BOOTSTRAP 95% CONFIDENCE INTERVALS
+# ================================================================
+
+bootstrap_metrics = {
+
+    metric: []
+
+    for metric
+    in final_metrics
+
+    if metric not in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]
+}
+
+
+rng = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+n_patients = len(
+    final_y
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+
+    idx = rng.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_boot = final_y[
+        idx
+    ]
+
+
+    p_boot = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_boot
+        )
+    ) < 2:
+
+        continue
+
+
+    boot_result = calculate_metrics(
+
+        y_boot,
+
+        p_boot,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    for metric in bootstrap_metrics:
+
+        bootstrap_metrics[
+            metric
+        ].append(
+
+            boot_result[
+                metric
+            ]
+        )
+
+
+# ================================================================
+# PERFORMANCE TABLE
+# ================================================================
+
+performance_rows = []
+
+
+for metric, estimate in final_metrics.items():
+
+    if metric in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]:
+
+        continue
+
+
+    values = np.asarray(
+
+        bootstrap_metrics[
+            metric
+        ]
+    )
+
+
+    performance_rows.append({
+
+        "Metric":
+            metric,
+
+        "Estimate":
+            estimate,
+
+        "95% CI Lower":
+            np.percentile(
+                values,
+                2.5
+            ),
+
+        "95% CI Upper":
+            np.percentile(
+                values,
+                97.5
+            )
+    })
+
+
+performance_ci_df = pd.DataFrame(
+    performance_rows
+)
+
+
+# ================================================================
+# 22. FINAL CONFUSION MATRIX
+# ================================================================
+
+final_predictions = (
+
+    final_prob
+
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+tn, fp, fn, tp = confusion_matrix(
+
+    final_y,
+
+    final_predictions,
+
+    labels=[0, 1]
+
+).ravel()
+
+
+confusion_df = pd.DataFrame({
+
+    "Measure": [
+
+        "True Negative",
+        "False Positive",
+        "False Negative",
+        "True Positive",
+        "Threshold"
+    ],
+
+    "Value": [
+
+        tn,
+        fp,
+        fn,
+        tp,
+        CLASSIFICATION_THRESHOLD
+    ]
+})
+
+
+# ================================================================
+# 23. FEATURE SELECTION FREQUENCY
+# ================================================================
+
+feature_frequency_df = (
+
+    selected_features_df
+
+    .groupby(
+        "Feature"
+    )
+
+    .agg(
+
+        Selection_Frequency=(
+            "Outer_Repetition",
+            "nunique"
+        ),
+
+        Mean_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "mean"
+        ),
+
+        SD_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "std"
+        )
+    )
+
+    .reset_index()
+)
+
+
+feature_frequency_df[
+    "Selection_Percent"
+] = (
+
+    feature_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+feature_frequency_df = (
+
+    feature_frequency_df
+
+    .sort_values(
+
+        [
+            "Selection_Frequency",
+            "Mean_XGB_Gain"
+        ],
+
+        ascending=[
+            False,
+            False
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 24. FEATURE COUNT SUMMARY
+# ================================================================
+
+k_summary_df = (
+
+    k_results_df
+
+    .groupby(
+        "Num_Features"
+    )
+
+    .agg(
+
+        Mean_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "mean"
+        ),
+
+        SD_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "std"
+        ),
+
+        Median_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "median"
+        )
+    )
+
+    .reset_index()
+)
+
+
+max_mean_auc = (
+
+    k_summary_df[
+        "Mean_Inner_CV_AUC"
+    ]
+
+    .max()
+)
+
+
+global_best_k = int(
+
+    k_summary_df.loc[
+
+        np.isclose(
+
+            k_summary_df[
+                "Mean_Inner_CV_AUC"
+            ],
+
+            max_mean_auc
+        ),
+
+        "Num_Features"
+
+    ].min()
+)
+
+
+k_summary_df[
+    "Global_Best_K"
+] = (
+
+    k_summary_df[
+        "Num_Features"
+    ]
+
+    ==
+    global_best_k
+)
+
+
+# ================================================================
+# 25. FREQUENCY OF SELECTED k
+# ================================================================
+
+k_frequency_df = (
+
+    outer_results_df[
+        "Selected_K"
+    ]
+
+    .value_counts()
+
+    .sort_index()
+
+    .rename_axis(
+        "Selected_K"
+    )
+
+    .reset_index(
+        name=
+            "Selection_Frequency"
+    )
+)
+
+
+k_frequency_df[
+    "Selection_Percent"
+] = (
+
+    k_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+# ================================================================
+# 26. KNN HYPERPARAMETER FREQUENCY
+# ================================================================
+
+hyperparameter_frequency_df = (
+
+    chosen_parameters_df
+
+    .groupby(
+
+        [
+            "Selected_K",
+            "n_neighbors",
+            "weights",
+            "p"
+        ],
+
+        dropna=False
+    )
+
+    .size()
+
+    .reset_index(
+        name="Frequency"
+    )
+
+    .sort_values(
+        "Frequency",
+        ascending=False
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 27. ROC CURVE + BOOTSTRAP CONFIDENCE BAND
+# ================================================================
+
+fpr, tpr, roc_thresholds = roc_curve(
+
+    final_y,
+
+    final_prob
+)
+
+
+final_auc = roc_auc_score(
+
+    final_y,
+
+    final_prob
+)
+
+
+mean_fpr = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_tprs = []
+
+
+rng_roc = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+
+    idx = rng_roc.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    fpr_b, tpr_b, _ = roc_curve(
+
+        y_b,
+
+        p_b
+    )
+
+
+    interp_tpr = np.interp(
+
+        mean_fpr,
+
+        fpr_b,
+
+        tpr_b
+    )
+
+
+    interp_tpr[0] = 0.0
+
+    interp_tpr[-1] = 1.0
+
+
+    bootstrap_tprs.append(
+        interp_tpr
+    )
+
+
+bootstrap_tprs = np.asarray(
+    bootstrap_tprs
+)
+
+
+roc_lower = np.percentile(
+
+    bootstrap_tprs,
+
+    2.5,
+
+    axis=0
+)
+
+
+roc_upper = np.percentile(
+
+    bootstrap_tprs,
+
+    97.5,
+
+    axis=0
+)
+
+
+auc_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ]
+
+    ==
+    "ROC_AUC"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    fpr,
+
+    tpr,
+
+    linewidth=2,
+
+    label=(
+
+        f"AUC = {final_auc:.3f} "
+
+        f"(95% CI "
+
+        f"{auc_row['95% CI Lower']:.3f}-"
+
+        f"{auc_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    mean_fpr,
+
+    roc_lower,
+
+    roc_upper,
+
+    alpha=0.2,
+
+    label=
+        "95% bootstrap band"
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label=
+        "Chance"
+)
+
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+
+plt.title(
+    "ROC Curve - XGBoost Selector + KNN"
+)
+
+
+plt.legend(
+    loc="lower right"
+)
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_KNN_ROC_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+roc_data_df = pd.DataFrame({
+
+    "FPR":
+        fpr,
+
+    "TPR":
+        tpr,
+
+    "Threshold":
+        roc_thresholds
+})
+
+
+roc_band_df = pd.DataFrame({
+
+    "FPR":
+        mean_fpr,
+
+    "TPR_95CI_Lower":
+        roc_lower,
+
+    "TPR_95CI_Upper":
+        roc_upper
+})
+
+
+# ================================================================
+# 28. PRECISION-RECALL CURVE + BOOTSTRAP BAND
+# ================================================================
+
+precision, recall, _ = (
+    precision_recall_curve(
+        final_y,
+        final_prob
+    )
+)
+
+
+final_ap = average_precision_score(
+
+    final_y,
+
+    final_prob
+)
+
+
+prevalence = np.mean(
+    final_y
+)
+
+
+recall_grid = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_precisions = []
+
+
+rng_pr = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+
+    idx = rng_pr.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    precision_b, recall_b, _ = (
+        precision_recall_curve(
+            y_b,
+            p_b
+        )
+    )
+
+
+    interp_precision = np.interp(
+
+        recall_grid,
+
+        recall_b[::-1],
+
+        precision_b[::-1]
+    )
+
+
+    bootstrap_precisions.append(
+        interp_precision
+    )
+
+
+bootstrap_precisions = np.asarray(
+    bootstrap_precisions
+)
+
+
+pr_lower = np.percentile(
+
+    bootstrap_precisions,
+
+    2.5,
+
+    axis=0
+)
+
+
+pr_upper = np.percentile(
+
+    bootstrap_precisions,
+
+    97.5,
+
+    axis=0
+)
+
+
+ap_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ]
+
+    ==
+    "PR_AUC_AP"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    recall,
+
+    precision,
+
+    linewidth=2,
+
+    label=(
+
+        f"AP = {final_ap:.3f} "
+
+        f"(95% CI "
+
+        f"{ap_row['95% CI Lower']:.3f}-"
+
+        f"{ap_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    recall_grid,
+
+    pr_lower,
+
+    pr_upper,
+
+    alpha=0.2,
+
+    label=
+        "95% bootstrap band"
+)
+
+
+plt.axhline(
+
+    prevalence,
+
+    linestyle="--",
+
+    label=(
+
+        f"Baseline prevalence = "
+        f"{prevalence:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Recall"
+)
+
+
+plt.ylabel(
+    "Precision"
+)
+
+
+plt.title(
+    "Precision-Recall Curve - XGBoost Selector + KNN"
+)
+
+
+plt.legend(
+    loc="lower left"
+)
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_KNN_PR_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+pr_data_df = pd.DataFrame({
+
+    "Recall":
+        recall,
+
+    "Precision":
+        precision
+})
+
+
+pr_band_df = pd.DataFrame({
+
+    "Recall":
+        recall_grid,
+
+    "Precision_95CI_Lower":
+        pr_lower,
+
+    "Precision_95CI_Upper":
+        pr_upper
+})
+
+
+# ================================================================
+# 29. CALIBRATION CURVE
+# ================================================================
+
+prob_true, prob_pred = calibration_curve(
+
+    final_y,
+
+    final_prob,
+
+    n_bins=
+        5,
+
+    strategy=
+        "quantile"
+)
+
+
+final_brier = brier_score_loss(
+
+    final_y,
+
+    final_prob
+)
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label=
+        "Perfect calibration"
+)
+
+
+plt.plot(
+
+    prob_pred,
+
+    prob_true,
+
+    marker="o",
+
+    linewidth=2,
+
+    label=(
+
+        f"Brier score = "
+        f"{final_brier:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Mean predicted probability"
+)
+
+
+plt.ylabel(
+    "Observed positive proportion"
+)
+
+
+plt.title(
+    "Calibration - XGBoost Selector + KNN"
+)
+
+
+plt.legend()
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_KNN_Calibration.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+calibration_df = pd.DataFrame({
+
+    "Mean_Predicted_Probability":
+        prob_pred,
+
+    "Observed_Positive_Proportion":
+        prob_true
+})
+
+
+# ================================================================
+# 30. METHOD INFORMATION
+# ================================================================
+
+method_info_df = pd.DataFrame({
+
+    "Item": [
+
+        "Number of patients",
+
+        "Initial radiomics features",
+
+        "Outer validation",
+
+        "Outer repetitions",
+
+        "Training fraction",
+
+        "Test fraction",
+
+        "Internal CV",
+
+        "Correlation method",
+
+        "Correlation threshold",
+
+        "Scaling",
+
+        "Feature selector",
+
+        "XGBoost importance type",
+
+        "XGB n_estimators",
+
+        "XGB max_depth",
+
+        "XGB learning_rate",
+
+        "Feature counts tested",
+
+        "Classifier",
+
+        "KNN n_neighbors",
+
+        "KNN weights",
+
+        "KNN p",
+
+        "Optimization metric",
+
+        "Classification threshold",
+
+        "Patient-level aggregation",
+
+        "Bootstrap repetitions",
+
+        "Global best feature count"
+    ],
+
+    "Value": [
+
+        len(y),
+
+        X.shape[1],
+
+        "Repeated stratified holdout",
+
+        N_OUTER_SPLITS,
+
+        1 - TEST_SIZE,
+
+        TEST_SIZE,
+
+        f"Stratified {INNER_FOLDS}-fold CV",
+
+        "Spearman absolute correlation",
+
+        CORRELATION_THRESHOLD,
+
+        "StandardScaler fitted within CV",
+
+        "XGBClassifier + SelectFromModel",
+
+        XGB_SELECTOR_IMPORTANCE_TYPE,
+
+        XGB_SELECTOR_N_ESTIMATORS,
+
+        XGB_SELECTOR_MAX_DEPTH,
+
+        XGB_SELECTOR_LEARNING_RATE,
+
+        str(
+            FEATURE_COUNTS
+        ),
+
+        "KNeighborsClassifier",
+
+        str(
+            param_grid[
+                "classifier__n_neighbors"
+            ]
+        ),
+
+        str(
+            param_grid[
+                "classifier__weights"
+            ]
+        ),
+
+        str(
+            param_grid[
+                "classifier__p"
+            ]
+        ),
+
+        "ROC-AUC",
+
+        CLASSIFICATION_THRESHOLD,
+
+        (
+            "Mean held-out probability "
+            "for each patient"
+        ),
+
+        N_BOOTSTRAP,
+
+        global_best_k
+    ]
+})
+
+
+# ================================================================
+# 31. SAVE COMPLETE EXCEL WORKBOOK
+# ================================================================
+
+FINAL_EXCEL = os.path.join(
+
+    OUTPUT_DIR,
+
+    "XGB_KNN_Final_Results.xlsx"
+)
+
+
+with pd.ExcelWriter(
+
+    FINAL_EXCEL,
+
+    engine="openpyxl"
+
+) as writer:
+
+
+    performance_ci_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Performance_95CI",
+
+        index=False
+    )
+
+
+    confusion_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Confusion_Matrix",
+
+        index=False
+    )
+
+
+    patient_oof_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Patient_OOF",
+
+        index=False
+    )
+
+
+    outer_results_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Outer_Splits",
+
+        index=False
+    )
+
+
+    k_results_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_InnerCV",
+
+        index=False
+    )
+
+
+    k_summary_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_Summary",
+
+        index=False
+    )
+
+
+    k_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_Frequency",
+
+        index=False
+    )
+
+
+    selected_features_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Selected_Features",
+
+        index=False
+    )
+
+
+    feature_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Feature_Frequency",
+
+        index=False
+    )
+
+
+    chosen_parameters_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Chosen_KNN_Params",
+
+        index=False
+    )
+
+
+    hyperparameter_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Hyperparam_Frequency",
+
+        index=False
+    )
+
+
+    test_predictions_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "HeldOut_Predictions",
+
+        index=False
+    )
+
+
+    roc_data_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "ROC_Data",
+
+        index=False
+    )
+
+
+    roc_band_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "ROC_95CI_Band",
+
+        index=False
+    )
+
+
+    pr_data_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "PR_Data",
+
+        index=False
+    )
+
+
+    pr_band_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "PR_95CI_Band",
+
+        index=False
+    )
+
+
+    calibration_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Calibration",
+
+        index=False
+    )
+
+
+    method_info_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Method_Info",
+
+        index=False
+    )
+
+
+# ================================================================
+# 32. FINAL OUTPUT
+# ================================================================
+
+print(
+    "\n========================================"
+)
+
+
+print(
+    "FINAL XGBOOST SELECTOR + KNN CLASSIFIER"
+)
+
+
+print(
+    "========================================"
+)
+
+
+print(
+
+    performance_ci_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nConfusion Matrix:"
+)
+
+
+print(
+
+    f"TN={tn}, "
+
+    f"FP={fp}, "
+
+    f"FN={fn}, "
+
+    f"TP={tp}"
+)
+
+
+print(
+    "\nGlobal best number of features "
+    "based on mean inner-CV AUC:"
+)
+
+
+print(
+    global_best_k
+)
+
+
+print(
+    "\nFeature-count summary:"
+)
+
+
+print(
+
+    k_summary_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nFeature-count selection frequency:"
+)
+
+
+print(
+
+    k_frequency_df
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected KNN parameters:"
+)
+
+
+print(
+
+    hyperparameter_frequency_df
+
+    .head(20)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected features:"
+)
+
+
+print(
+
+    feature_frequency_df
+
+    .head(20)
+
+    .round(4)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nExcel saved to:"
+)
+
+
+print(
+    FINAL_EXCEL
+)
+
+
+print(
+    "\nFigures saved to:"
+)
+
+
+print(
+    FIGURE_DIR
+)
+
+
+print(
+    "\nAnalysis completed successfully."
+)
+# ================================================================
+# XGBOOST FEATURE SELECTOR -> SVM CLASSIFIER
+#
+# 50 repeated stratified holdout splits
+# 85% training / 15% held-out test
+# Internal stratified 5-fold CV
+# Correlation filtering inside CV
+# Feature counts: 3-10
+# ================================================================
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, TransformerMixin
+
+from sklearn.model_selection import (
+    StratifiedShuffleSplit,
+    StratifiedKFold,
+    GridSearchCV,
+    ParameterGrid
+)
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectFromModel
+
+from sklearn.svm import SVC
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    brier_score_loss,
+    roc_curve,
+    precision_recall_curve
+)
+
+from sklearn.calibration import calibration_curve
+
+from xgboost import XGBClassifier
+
+
+warnings.filterwarnings("ignore")
+
+
+# ================================================================
+# 1. USER SETTINGS
+# ================================================================
+
+INPUT_FILE = (
+    r"C:\Users\zaman\Downloads\radiomics_features_BW25.xlsx"
+)
+
+LABEL_COL = "label"
+ID_COL = None
+
+
+# ================================================================
+# 2. VALIDATION SETTINGS
+# ================================================================
+
+N_OUTER_SPLITS = 50
+TEST_SIZE = 0.15
+INNER_FOLDS = 5
+
+FEATURE_COUNTS = list(range(3, 11))
+
+CORRELATION_THRESHOLD = 0.90
+CLASSIFICATION_THRESHOLD = 0.50
+
+RANDOM_STATE = 42
+N_BOOTSTRAP = 5000
+
+
+# ================================================================
+# 3. FIXED XGBOOST FEATURE SELECTOR SETTINGS
+# ================================================================
+
+XGB_SELECTOR_N_ESTIMATORS = 100
+XGB_SELECTOR_MAX_DEPTH = 3
+XGB_SELECTOR_LEARNING_RATE = 0.05
+
+XGB_SELECTOR_SUBSAMPLE = 0.80
+XGB_SELECTOR_COLSAMPLE_BYTREE = 0.80
+
+XGB_SELECTOR_REG_ALPHA = 0.0
+XGB_SELECTOR_REG_LAMBDA = 1.0
+
+XGB_SELECTOR_IMPORTANCE_TYPE = "gain"
+
+
+# ================================================================
+# 4. OUTPUT
+# ================================================================
+
+desktop = os.path.join(
+    os.path.expanduser("~"),
+    "Desktop"
+)
+
+OUTPUT_DIR = os.path.join(
+    desktop,
+    "XGB_SVM_Revised_Results"
+)
+
+FIGURE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "Figures"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    FIGURE_DIR,
+    exist_ok=True
+)
+
+
+# ================================================================
+# 5. CORRELATION FILTER
+# ================================================================
+
+class CorrelationFilter(
+    BaseEstimator,
+    TransformerMixin
+):
+
+    def __init__(
+        self,
+        threshold=0.90,
+        method="spearman"
+    ):
+
+        self.threshold = threshold
+        self.method = method
+
+
+    def fit(
+        self,
+        X,
+        y=None
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+            X = pd.DataFrame(X)
+
+
+        self.feature_names_in_ = np.asarray(
+            X.columns
+        )
+
+
+        # --------------------------------------------------------
+        # Remove constant features
+        # --------------------------------------------------------
+
+        nunique = X.nunique(
+            dropna=False
+        )
+
+        self.constant_features_ = list(
+            nunique[
+                nunique <= 1
+            ].index
+        )
+
+
+        X_temp = X.drop(
+            columns=self.constant_features_,
+            errors="ignore"
+        )
+
+
+        # --------------------------------------------------------
+        # Spearman correlation
+        # --------------------------------------------------------
+
+        corr = X_temp.corr(
+            method=self.method
+        ).abs()
+
+
+        upper = corr.where(
+
+            np.triu(
+                np.ones(
+                    corr.shape
+                ),
+                k=1
+            ).astype(bool)
+        )
+
+
+        self.correlated_features_ = [
+
+            col
+            for col in upper.columns
+
+            if (
+                upper[col]
+                >
+                self.threshold
+            ).any()
+        ]
+
+
+        self.features_to_keep_ = [
+
+            col
+            for col in X_temp.columns
+
+            if col not in self.correlated_features_
+        ]
+
+
+        return self
+
+
+    def transform(
+        self,
+        X
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+
+            X = pd.DataFrame(
+                X,
+                columns=self.feature_names_in_
+            )
+
+
+        return X[
+            self.features_to_keep_
+        ].copy()
+
+
+    def get_feature_names_out(
+        self,
+        input_features=None
+    ):
+
+        return np.asarray(
+            self.features_to_keep_
+        )
+
+
+# ================================================================
+# 6. LOAD DATA
+# ================================================================
+
+df = pd.read_excel(
+    INPUT_FILE
+)
+
+df.columns = (
+    df.columns
+    .astype(str)
+    .str.strip()
+)
+
+
+# ================================================================
+# 7. FIND LABEL
+# ================================================================
+
+if LABEL_COL not in df.columns:
+
+    possible_labels = [
+        "label",
+        "Label",
+        "Outcome",
+        "outcome"
+    ]
+
+    found = [
+        c
+        for c in possible_labels
+        if c in df.columns
+    ]
+
+    if len(found) == 0:
+
+        raise ValueError(
+            "Label column not found."
+        )
+
+    LABEL_COL = found[0]
+
+
+# ================================================================
+# 8. FIND PATIENT ID
+# ================================================================
+
+if ID_COL is None:
+
+    possible_ids = [
+        "PatientID",
+        "patient_id",
+        "Image",
+        "ID"
+    ]
+
+    found = [
+        c
+        for c in possible_ids
+        if c in df.columns
+    ]
+
+    if len(found) > 0:
+
+        ID_COL = found[0]
+
+    else:
+
+        ID_COL = "RowID"
+
+        df[ID_COL] = np.arange(
+            len(df)
+        )
+
+
+# ================================================================
+# 9. LABEL AND IDs
+# ================================================================
+
+y = (
+    df[LABEL_COL]
+    .astype(int)
+    .reset_index(drop=True)
+)
+
+patient_ids = (
+    df[ID_COL]
+    .astype(str)
+    .reset_index(drop=True)
+)
+
+
+# ================================================================
+# 10. REMOVE METADATA
+# ================================================================
+
+metadata_cols = [
+
+    LABEL_COL,
+    ID_COL,
+
+    "PatientID",
+    "patient_id",
+    "ID",
+    "RowID",
+
+    "Image",
+    "ImageFile",
+    "MaskFile",
+    "MaskLabel",
+    "ROIVoxels",
+
+    "label",
+    "Label",
+    "Outcome",
+    "outcome"
+]
+
+
+X = df.drop(
+    columns=metadata_cols,
+    errors="ignore"
+)
+
+
+# ================================================================
+# KEEP ONLY NUMERIC FEATURES
+# ================================================================
+
+non_numeric = (
+    X
+    .select_dtypes(
+        exclude=[np.number]
+    )
+    .columns
+    .tolist()
+)
+
+
+if len(non_numeric) > 0:
+
+    print(
+        "Dropping non-numeric columns:",
+        non_numeric
+    )
+
+    X = X.drop(
+        columns=non_numeric
+    )
+
+
+X = X.reset_index(
+    drop=True
+)
+
+
+# ================================================================
+# SAFETY CHECKS
+# ================================================================
+
+if X.isna().any().any():
+
+    raise ValueError(
+        "Missing values found in feature matrix."
+    )
+
+
+if np.isinf(
+    X.to_numpy()
+).any():
+
+    raise ValueError(
+        "Infinite values found in feature matrix."
+    )
+
+
+if set(
+    np.unique(y)
+) != {0, 1}:
+
+    raise ValueError(
+        "Outcome must contain only 0 and 1."
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    "DATASET"
+)
+
+print(
+    "========================================"
+)
+
+print(
+    "Patients:",
+    len(y)
+)
+
+print(
+    "Radiomics features:",
+    X.shape[1]
+)
+
+print(
+    "\nClass distribution:"
+)
+
+print(
+    y.value_counts().sort_index()
+)
+
+
+# ================================================================
+# 11. SVM HYPERPARAMETER GRID
+# ================================================================
+#
+# Linear:
+#     C = 0.01, 0.1, 1, 10, 100
+#     class_weight = None / balanced
+#
+# RBF:
+#     C = 0.01, 0.1, 1, 10, 100
+#     gamma = scale, 0.01, 0.1, 1
+#     class_weight = None / balanced
+#
+# ================================================================
+
+param_grid = [
+
+    # ------------------------------------------------------------
+    # Linear SVM
+    # ------------------------------------------------------------
+
+    {
+        "classifier__kernel": [
+            "linear"
+        ],
+
+        "classifier__C": [
+            0.01,
+            0.1,
+            1,
+            10,
+            100
+        ],
+
+        "classifier__class_weight": [
+            None,
+            "balanced"
+        ]
+    },
+
+
+    # ------------------------------------------------------------
+    # RBF SVM
+    # ------------------------------------------------------------
+
+    {
+        "classifier__kernel": [
+            "rbf"
+        ],
+
+        "classifier__C": [
+            0.01,
+            0.1,
+            1,
+            10,
+            100
+        ],
+
+        "classifier__gamma": [
+            "scale",
+            0.01,
+            0.1,
+            1
+        ],
+
+        "classifier__class_weight": [
+            None,
+            "balanced"
+        ]
+    }
+]
+
+
+print(
+    "\nSVM hyperparameter combinations:",
+    len(
+        list(
+            ParameterGrid(
+                param_grid
+            )
+        )
+    )
+)
+
+
+# ================================================================
+# 12. METRIC FUNCTION
+# ================================================================
+
+def calculate_metrics(
+    y_true,
+    probabilities,
+    threshold=0.50
+):
+
+    y_true = np.asarray(
+        y_true
+    ).astype(int)
+
+    probabilities = np.asarray(
+        probabilities
+    ).astype(float)
+
+
+    predictions = (
+
+        probabilities
+        >= threshold
+
+    ).astype(int)
+
+
+    tn, fp, fn, tp = confusion_matrix(
+
+        y_true,
+        predictions,
+
+        labels=[0, 1]
+
+    ).ravel()
+
+
+    sensitivity = recall_score(
+
+        y_true,
+        predictions,
+
+        pos_label=1,
+
+        zero_division=0
+    )
+
+
+    specificity = recall_score(
+
+        y_true,
+        predictions,
+
+        pos_label=0,
+
+        zero_division=0
+    )
+
+
+    precision = precision_score(
+
+        y_true,
+        predictions,
+
+        zero_division=0
+    )
+
+
+    npv = (
+
+        tn / (tn + fn)
+
+        if (tn + fn) > 0
+
+        else 0
+    )
+
+
+    gmean = np.sqrt(
+        sensitivity
+        *
+        specificity
+    )
+
+
+    return {
+
+        "ROC_AUC":
+            roc_auc_score(
+                y_true,
+                probabilities
+            ),
+
+        "PR_AUC_AP":
+            average_precision_score(
+                y_true,
+                probabilities
+            ),
+
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Balanced_Accuracy":
+            balanced_accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Sensitivity":
+            sensitivity,
+
+        "Specificity":
+            specificity,
+
+        "Precision_PPV":
+            precision,
+
+        "NPV":
+            npv,
+
+        "F1":
+            f1_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "G_mean":
+            gmean,
+
+        "Brier_Score":
+            brier_score_loss(
+                y_true,
+                probabilities
+            ),
+
+        "TN":
+            tn,
+
+        "FP":
+            fp,
+
+        "FN":
+            fn,
+
+        "TP":
+            tp
+    }
+
+
+# ================================================================
+# 13. OUTER REPEATED STRATIFIED HOLDOUT
+# ================================================================
+
+outer_splitter = StratifiedShuffleSplit(
+
+    n_splits=
+        N_OUTER_SPLITS,
+
+    test_size=
+        TEST_SIZE,
+
+    random_state=
+        RANDOM_STATE
+)
+
+
+# ================================================================
+# STORAGE
+# ================================================================
+
+outer_results = []
+
+k_search_results = []
+
+test_prediction_records = []
+
+selected_feature_records = []
+
+chosen_parameter_records = []
+
+
+# ================================================================
+# 14. MAIN LOOP
+# ================================================================
+
+for outer_number, (
+    train_idx,
+    test_idx
+) in enumerate(
+
+    outer_splitter.split(
+        X,
+        y
+    ),
+
+    start=1
+):
+
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        f"Outer repetition "
+        f"{outer_number}/"
+        f"{N_OUTER_SPLITS}"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+    # ============================================================
+    # OUTER TRAIN / TEST
+    # ============================================================
+
+    X_train = X.iloc[
+        train_idx
+    ].copy()
+
+    X_test = X.iloc[
+        test_idx
+    ].copy()
+
+    y_train = y.iloc[
+        train_idx
+    ].copy()
+
+    y_test = y.iloc[
+        test_idx
+    ].copy()
+
+
+    # ============================================================
+    # INNER STRATIFIED 5-FOLD CV
+    # ============================================================
+
+    inner_cv = StratifiedKFold(
+
+        n_splits=
+            INNER_FOLDS,
+
+        shuffle=True,
+
+        random_state=
+            RANDOM_STATE
+            +
+            outer_number
+    )
+
+
+    best_inner_auc = -np.inf
+
+    selected_k = None
+
+    selected_grid = None
+
+
+    # ============================================================
+    # TEST FEATURE COUNTS 3-10
+    # ============================================================
+
+    for num_features in FEATURE_COUNTS:
+
+
+        # ========================================================
+        # XGBOOST FEATURE SELECTOR
+        # ========================================================
+
+        xgb_selector = XGBClassifier(
+
+            objective=
+                "binary:logistic",
+
+            n_estimators=
+                XGB_SELECTOR_N_ESTIMATORS,
+
+            max_depth=
+                XGB_SELECTOR_MAX_DEPTH,
+
+            learning_rate=
+                XGB_SELECTOR_LEARNING_RATE,
+
+            subsample=
+                XGB_SELECTOR_SUBSAMPLE,
+
+            colsample_bytree=
+                XGB_SELECTOR_COLSAMPLE_BYTREE,
+
+            reg_alpha=
+                XGB_SELECTOR_REG_ALPHA,
+
+            reg_lambda=
+                XGB_SELECTOR_REG_LAMBDA,
+
+            importance_type=
+                XGB_SELECTOR_IMPORTANCE_TYPE,
+
+            eval_metric=
+                "logloss",
+
+            tree_method=
+                "hist",
+
+            random_state=
+                RANDOM_STATE,
+
+            n_jobs=1
+        )
+
+
+        # ========================================================
+        # PIPELINE
+        #
+        # Spearman correlation
+        #       ↓
+        # StandardScaler
+        #       ↓
+        # XGBoost selector
+        #       ↓
+        # Top k features
+        #       ↓
+        # SVM classifier
+        #
+        # ALL learned steps fitted inside CV
+        # ========================================================
+
+        pipeline = Pipeline(
+
+            steps=[
+
+                (
+                    "corr_filter",
+
+                    CorrelationFilter(
+
+                        threshold=
+                            CORRELATION_THRESHOLD,
+
+                        method=
+                            "spearman"
+                    )
+                ),
+
+
+                (
+                    "scaler",
+
+                    StandardScaler()
+                ),
+
+
+                (
+                    "selector",
+
+                    SelectFromModel(
+
+                        estimator=
+                            xgb_selector,
+
+                        threshold=
+                            -np.inf,
+
+                        max_features=
+                            num_features
+                    )
+                ),
+
+
+                (
+                    "classifier",
+
+                    SVC(
+
+                        probability=True,
+
+                        random_state=
+                            RANDOM_STATE,
+
+                        cache_size=1000
+                    )
+                )
+            ]
+        )
+
+
+        # ========================================================
+        # GRID SEARCH
+        # ========================================================
+
+        grid_search = GridSearchCV(
+
+            estimator=
+                pipeline,
+
+            param_grid=
+                param_grid,
+
+            scoring=
+                "roc_auc",
+
+            cv=
+                inner_cv,
+
+            refit=True,
+
+            n_jobs=-1,
+
+            return_train_score=False,
+
+            error_score="raise",
+
+            verbose=0
+        )
+
+
+        # ========================================================
+        # FIT ONLY ON OUTER TRAINING DATA
+        # ========================================================
+
+        grid_search.fit(
+            X_train,
+            y_train
+        )
+
+
+        current_inner_auc = (
+            grid_search.best_score_
+        )
+
+
+        best_params_k = (
+            grid_search.best_params_
+        )
+
+
+        # ========================================================
+        # STORE RESULTS FOR THIS k
+        # ========================================================
+
+        k_search_results.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Num_Features":
+                num_features,
+
+            "Best_Inner_CV_AUC":
+                current_inner_auc,
+
+            "Best_kernel":
+                best_params_k.get(
+                    "classifier__kernel"
+                ),
+
+            "Best_C":
+                best_params_k.get(
+                    "classifier__C"
+                ),
+
+            "Best_gamma":
+                str(
+                    best_params_k.get(
+                        "classifier__gamma",
+                        "Not applicable"
+                    )
+                ),
+
+            "Best_class_weight":
+                str(
+                    best_params_k.get(
+                        "classifier__class_weight"
+                    )
+                )
+        })
+
+
+        print(
+
+            f"k={num_features} | "
+
+            f"Inner AUC="
+            f"{current_inner_auc:.3f} | "
+
+            f"kernel="
+            f"{best_params_k.get('classifier__kernel')} | "
+
+            f"C="
+            f"{best_params_k.get('classifier__C')} | "
+
+            f"gamma="
+            f"{best_params_k.get('classifier__gamma', 'NA')} | "
+
+            f"class_weight="
+            f"{best_params_k.get('classifier__class_weight')}"
+        )
+
+
+        # ========================================================
+        # SELECT BEST k
+        #
+        # Exact tie -> smaller k remains
+        # ========================================================
+
+        if (
+
+            current_inner_auc
+            >
+            best_inner_auc
+            +
+            1e-12
+
+        ):
+
+            best_inner_auc = (
+                current_inner_auc
+            )
+
+            selected_k = (
+                num_features
+            )
+
+            selected_grid = (
+                grid_search
+            )
+
+
+    # ============================================================
+    # 15. FINAL REFITTED MODEL FOR THIS REPETITION
+    # ============================================================
+
+    best_model = (
+        selected_grid
+        .best_estimator_
+    )
+
+
+    # ============================================================
+    # 16. HELD-OUT TEST
+    # ============================================================
+
+    y_test_prob = (
+
+        best_model
+
+        .predict_proba(
+            X_test
+        )[:, 1]
+    )
+
+
+    y_test_pred = (
+
+        y_test_prob
+        >=
+        CLASSIFICATION_THRESHOLD
+
+    ).astype(int)
+
+
+    test_metrics = calculate_metrics(
+
+        y_test,
+
+        y_test_prob,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    # ============================================================
+    # SELECTED FEATURES
+    # ============================================================
+
+    fitted_corr_filter = (
+
+        best_model
+
+        .named_steps[
+            "corr_filter"
+        ]
+    )
+
+
+    corr_feature_names = (
+
+        fitted_corr_filter
+        .get_feature_names_out()
+    )
+
+
+    fitted_selector = (
+
+        best_model
+
+        .named_steps[
+            "selector"
+        ]
+    )
+
+
+    selected_mask = (
+
+        fitted_selector
+        .get_support()
+    )
+
+
+    selected_feature_names = (
+
+        corr_feature_names[
+            selected_mask
+        ]
+    )
+
+
+    # ============================================================
+    # XGBOOST GAIN IMPORTANCE
+    # ============================================================
+
+    xgb_importance = (
+
+        fitted_selector
+
+        .estimator_
+
+        .feature_importances_
+    )
+
+
+    selected_importance = (
+
+        xgb_importance[
+            selected_mask
+        ]
+    )
+
+
+    for feature_name, importance in zip(
+
+        selected_feature_names,
+
+        selected_importance
+
+    ):
+
+        selected_feature_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Selected_K":
+                selected_k,
+
+            "Feature":
+                feature_name,
+
+            "XGB_Gain_Importance":
+                importance
+        })
+
+
+    # ============================================================
+    # STORE CHOSEN SVM PARAMETERS
+    # ============================================================
+
+    best_params = (
+        selected_grid
+        .best_params_
+    )
+
+
+    chosen_parameter_records.append({
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "kernel":
+            best_params.get(
+                "classifier__kernel"
+            ),
+
+        "C":
+            best_params.get(
+                "classifier__C"
+            ),
+
+        "gamma":
+            str(
+                best_params.get(
+                    "classifier__gamma",
+                    "Not applicable"
+                )
+            ),
+
+        "class_weight":
+            str(
+                best_params.get(
+                    "classifier__class_weight"
+                )
+            )
+    })
+
+
+    # ============================================================
+    # STORE OUTER RESULT
+    # ============================================================
+
+    outer_record = {
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Train_n":
+            len(train_idx),
+
+        "Test_n":
+            len(test_idx),
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "Features_after_Correlation":
+            len(
+                corr_feature_names
+            ),
+
+        "Constant_Features_Removed":
+            len(
+                fitted_corr_filter
+                .constant_features_
+            ),
+
+        "Correlated_Features_Removed":
+            len(
+                fitted_corr_filter
+                .correlated_features_
+            )
+    }
+
+
+    outer_record.update(
+        test_metrics
+    )
+
+
+    outer_results.append(
+        outer_record
+    )
+
+
+    # ============================================================
+    # STORE HELD-OUT PREDICTIONS
+    # ============================================================
+
+    for local_position, row_index in enumerate(
+        test_idx
+    ):
+
+        test_prediction_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Row_Index":
+                int(
+                    row_index
+                ),
+
+            "PatientID":
+                patient_ids.iloc[
+                    row_index
+                ],
+
+            "True_Label":
+                int(
+                    y.iloc[
+                        row_index
+                    ]
+                ),
+
+            "Test_Probability":
+                float(
+                    y_test_prob[
+                        local_position
+                    ]
+                ),
+
+            "Test_Prediction":
+                int(
+                    y_test_pred[
+                        local_position
+                    ]
+                ),
+
+            "Selected_K":
+                selected_k
+        })
+
+
+    print(
+        "\nSelected k:",
+        selected_k
+    )
+
+
+    print(
+        "Best inner CV AUC:",
+        round(
+            best_inner_auc,
+            3
+        )
+    )
+
+
+    print(
+        "Held-out test AUC:",
+        round(
+            test_metrics[
+                "ROC_AUC"
+            ],
+            3
+        )
+    )
+
+
+    print(
+        "Best SVM parameters:",
+        best_params
+    )
+
+
+    # ============================================================
+    # CHECKPOINTS
+    # ============================================================
+
+    pd.DataFrame(
+        outer_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_outer_results.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        k_search_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_k_search.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        test_prediction_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_test_predictions.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        selected_feature_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_selected_features.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        chosen_parameter_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_SVM_hyperparameters.csv"
+        ),
+
+        index=False
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    f"ALL {N_OUTER_SPLITS} REPETITIONS FINISHED"
+)
+
+print(
+    "========================================"
+)
+
+
+# ================================================================
+# 17. CONVERT TO DATAFRAMES
+# ================================================================
+
+outer_results_df = pd.DataFrame(
+    outer_results
+)
+
+k_results_df = pd.DataFrame(
+    k_search_results
+)
+
+test_predictions_df = pd.DataFrame(
+    test_prediction_records
+)
+
+selected_features_df = pd.DataFrame(
+    selected_feature_records
+)
+
+chosen_parameters_df = pd.DataFrame(
+    chosen_parameter_records
+)
+
+
+# ================================================================
+# 18. PATIENT-LEVEL AGGREGATION
+# ================================================================
+
+patient_oof_df = (
+
+    test_predictions_df
+
+    .groupby(
+        "Row_Index"
+    )
+
+    .agg(
+
+        PatientID=(
+            "PatientID",
+            "first"
+        ),
+
+        True_Label=(
+            "True_Label",
+            "first"
+        ),
+
+        Mean_OOF_Probability=(
+            "Test_Probability",
+            "mean"
+        ),
+
+        SD_OOF_Probability=(
+            "Test_Probability",
+            "std"
+        ),
+
+        Test_Appearances=(
+            "Test_Probability",
+            "size"
+        )
+    )
+
+    .reset_index()
+)
+
+
+patient_oof_df[
+    "SD_OOF_Probability"
+] = (
+
+    patient_oof_df[
+        "SD_OOF_Probability"
+    ]
+
+    .fillna(0)
+)
+
+
+patient_oof_df[
+    "OOF_Prediction"
+] = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+if len(
+    patient_oof_df
+) != len(y):
+
+    print(
+        "\nWARNING: Not every patient appeared "
+        "in the held-out test set."
+    )
+
+    print(
+        "Patients with held-out predictions:",
+        len(patient_oof_df),
+        "/",
+        len(y)
+    )
+
+
+patient_oof_df = (
+
+    patient_oof_df
+
+    .sort_values(
+        "Row_Index"
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+final_y = (
+
+    patient_oof_df[
+        "True_Label"
+    ]
+
+    .to_numpy()
+
+    .astype(int)
+)
+
+
+final_prob = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    .to_numpy()
+)
+
+
+# ================================================================
+# 19. FINAL PERFORMANCE
+# ================================================================
+
+final_metrics = calculate_metrics(
+
+    final_y,
+
+    final_prob,
+
+    threshold=
+        CLASSIFICATION_THRESHOLD
+)
+
+
+# ================================================================
+# 20. BOOTSTRAP 95% CI
+# ================================================================
+
+bootstrap_metrics = {
+
+    metric: []
+
+    for metric
+    in final_metrics
+
+    if metric not in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]
+}
+
+
+rng = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+n_patients = len(
+    final_y
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_boot = final_y[
+        idx
+    ]
+
+    p_boot = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_boot
+        )
+    ) < 2:
+
+        continue
+
+
+    boot_result = calculate_metrics(
+
+        y_boot,
+
+        p_boot,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    for metric in bootstrap_metrics:
+
+        bootstrap_metrics[
+            metric
+        ].append(
+
+            boot_result[
+                metric
+            ]
+        )
+
+
+# ================================================================
+# PERFORMANCE TABLE
+# ================================================================
+
+performance_rows = []
+
+
+for metric, estimate in final_metrics.items():
+
+    if metric in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]:
+
+        continue
+
+
+    values = np.asarray(
+
+        bootstrap_metrics[
+            metric
+        ]
+    )
+
+
+    performance_rows.append({
+
+        "Metric":
+            metric,
+
+        "Estimate":
+            estimate,
+
+        "95% CI Lower":
+            np.percentile(
+                values,
+                2.5
+            ),
+
+        "95% CI Upper":
+            np.percentile(
+                values,
+                97.5
+            )
+    })
+
+
+performance_ci_df = pd.DataFrame(
+    performance_rows
+)
+
+
+# ================================================================
+# 21. CONFUSION MATRIX
+# ================================================================
+
+final_predictions = (
+
+    final_prob
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+tn, fp, fn, tp = confusion_matrix(
+
+    final_y,
+
+    final_predictions,
+
+    labels=[0, 1]
+
+).ravel()
+
+
+confusion_df = pd.DataFrame({
+
+    "Measure": [
+        "TN",
+        "FP",
+        "FN",
+        "TP",
+        "Threshold"
+    ],
+
+    "Value": [
+        tn,
+        fp,
+        fn,
+        tp,
+        CLASSIFICATION_THRESHOLD
+    ]
+})
+
+
+# ================================================================
+# 22. FEATURE FREQUENCY
+# ================================================================
+
+feature_frequency_df = (
+
+    selected_features_df
+
+    .groupby(
+        "Feature"
+    )
+
+    .agg(
+
+        Selection_Frequency=(
+            "Outer_Repetition",
+            "nunique"
+        ),
+
+        Mean_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "mean"
+        ),
+
+        SD_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "std"
+        )
+    )
+
+    .reset_index()
+)
+
+
+feature_frequency_df[
+    "Selection_Percent"
+] = (
+
+    feature_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+feature_frequency_df = (
+
+    feature_frequency_df
+
+    .sort_values(
+
+        [
+            "Selection_Frequency",
+            "Mean_XGB_Gain"
+        ],
+
+        ascending=[
+            False,
+            False
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 23. FEATURE COUNT SUMMARY
+# ================================================================
+
+k_summary_df = (
+
+    k_results_df
+
+    .groupby(
+        "Num_Features"
+    )
+
+    .agg(
+
+        Mean_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "mean"
+        ),
+
+        SD_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "std"
+        ),
+
+        Median_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "median"
+        )
+    )
+
+    .reset_index()
+)
+
+
+max_mean_auc = (
+
+    k_summary_df[
+        "Mean_Inner_CV_AUC"
+    ]
+
+    .max()
+)
+
+
+global_best_k = int(
+
+    k_summary_df.loc[
+
+        np.isclose(
+
+            k_summary_df[
+                "Mean_Inner_CV_AUC"
+            ],
+
+            max_mean_auc
+        ),
+
+        "Num_Features"
+
+    ].min()
+)
+
+
+k_summary_df[
+    "Global_Best_K"
+] = (
+
+    k_summary_df[
+        "Num_Features"
+    ]
+
+    ==
+    global_best_k
+)
+
+
+# ================================================================
+# 24. k FREQUENCY
+# ================================================================
+
+k_frequency_df = (
+
+    outer_results_df[
+        "Selected_K"
+    ]
+
+    .value_counts()
+
+    .sort_index()
+
+    .rename_axis(
+        "Selected_K"
+    )
+
+    .reset_index(
+        name=
+            "Selection_Frequency"
+    )
+)
+
+
+k_frequency_df[
+    "Selection_Percent"
+] = (
+
+    k_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+# ================================================================
+# 25. SVM HYPERPARAMETER FREQUENCY
+# ================================================================
+
+hyperparameter_frequency_df = (
+
+    chosen_parameters_df
+
+    .groupby(
+
+        [
+            "Selected_K",
+            "kernel",
+            "C",
+            "gamma",
+            "class_weight"
+        ],
+
+        dropna=False
+    )
+
+    .size()
+
+    .reset_index(
+        name="Frequency"
+    )
+
+    .sort_values(
+        "Frequency",
+        ascending=False
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 26. ROC CURVE + 95% BOOTSTRAP BAND
+# ================================================================
+
+fpr, tpr, roc_thresholds = roc_curve(
+
+    final_y,
+
+    final_prob
+)
+
+
+final_auc = roc_auc_score(
+
+    final_y,
+
+    final_prob
+)
+
+
+mean_fpr = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_tprs = []
+
+
+rng_roc = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng_roc.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    fpr_b, tpr_b, _ = roc_curve(
+
+        y_b,
+
+        p_b
+    )
+
+
+    interp_tpr = np.interp(
+
+        mean_fpr,
+
+        fpr_b,
+
+        tpr_b
+    )
+
+
+    interp_tpr[0] = 0.0
+
+    interp_tpr[-1] = 1.0
+
+
+    bootstrap_tprs.append(
+        interp_tpr
+    )
+
+
+bootstrap_tprs = np.asarray(
+    bootstrap_tprs
+)
+
+
+roc_lower = np.percentile(
+
+    bootstrap_tprs,
+
+    2.5,
+
+    axis=0
+)
+
+
+roc_upper = np.percentile(
+
+    bootstrap_tprs,
+
+    97.5,
+
+    axis=0
+)
+
+
+auc_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ] == "ROC_AUC"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    fpr,
+
+    tpr,
+
+    linewidth=2,
+
+    label=(
+
+        f"AUC = {final_auc:.3f} "
+        f"(95% CI "
+        f"{auc_row['95% CI Lower']:.3f}-"
+        f"{auc_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    mean_fpr,
+
+    roc_lower,
+
+    roc_upper,
+
+    alpha=0.2,
+
+    label="95% bootstrap band"
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label="Chance"
+)
+
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+plt.title(
+    "ROC Curve - XGBoost Selector + SVM"
+)
+
+plt.legend(
+    loc="lower right"
+)
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_SVM_ROC_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+roc_data_df = pd.DataFrame({
+
+    "FPR":
+        fpr,
+
+    "TPR":
+        tpr,
+
+    "Threshold":
+        roc_thresholds
+})
+
+
+roc_band_df = pd.DataFrame({
+
+    "FPR":
+        mean_fpr,
+
+    "TPR_95CI_Lower":
+        roc_lower,
+
+    "TPR_95CI_Upper":
+        roc_upper
+})
+
+
+# ================================================================
+# 27. PRECISION-RECALL CURVE + 95% BOOTSTRAP BAND
+# ================================================================
+
+precision, recall, _ = precision_recall_curve(
+
+    final_y,
+
+    final_prob
+)
+
+
+final_ap = average_precision_score(
+
+    final_y,
+
+    final_prob
+)
+
+
+prevalence = np.mean(
+    final_y
+)
+
+
+recall_grid = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_precisions = []
+
+
+rng_pr = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng_pr.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    precision_b, recall_b, _ = precision_recall_curve(
+
+        y_b,
+
+        p_b
+    )
+
+
+    interp_precision = np.interp(
+
+        recall_grid,
+
+        recall_b[::-1],
+
+        precision_b[::-1]
+    )
+
+
+    bootstrap_precisions.append(
+        interp_precision
+    )
+
+
+bootstrap_precisions = np.asarray(
+    bootstrap_precisions
+)
+
+
+pr_lower = np.percentile(
+
+    bootstrap_precisions,
+
+    2.5,
+
+    axis=0
+)
+
+
+pr_upper = np.percentile(
+
+    bootstrap_precisions,
+
+    97.5,
+
+    axis=0
+)
+
+
+ap_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ] == "PR_AUC_AP"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    recall,
+
+    precision,
+
+    linewidth=2,
+
+    label=(
+
+        f"AP = {final_ap:.3f} "
+        f"(95% CI "
+        f"{ap_row['95% CI Lower']:.3f}-"
+        f"{ap_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    recall_grid,
+
+    pr_lower,
+
+    pr_upper,
+
+    alpha=0.2,
+
+    label="95% bootstrap band"
+)
+
+
+plt.axhline(
+
+    prevalence,
+
+    linestyle="--",
+
+    label=(
+        f"Baseline prevalence = "
+        f"{prevalence:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Recall"
+)
+
+plt.ylabel(
+    "Precision"
+)
+
+plt.title(
+    "Precision-Recall Curve - XGBoost Selector + SVM"
+)
+
+plt.legend(
+    loc="lower left"
+)
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_SVM_PR_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+pr_data_df = pd.DataFrame({
+
+    "Recall":
+        recall,
+
+    "Precision":
+        precision
+})
+
+
+pr_band_df = pd.DataFrame({
+
+    "Recall":
+        recall_grid,
+
+    "Precision_95CI_Lower":
+        pr_lower,
+
+    "Precision_95CI_Upper":
+        pr_upper
+})
+
+
+# ================================================================
+# 28. CALIBRATION
+# ================================================================
+
+prob_true, prob_pred = calibration_curve(
+
+    final_y,
+
+    final_prob,
+
+    n_bins=5,
+
+    strategy="quantile"
+)
+
+
+final_brier = brier_score_loss(
+
+    final_y,
+
+    final_prob
+)
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label="Perfect calibration"
+)
+
+
+plt.plot(
+
+    prob_pred,
+
+    prob_true,
+
+    marker="o",
+
+    linewidth=2,
+
+    label=(
+        f"Brier score = "
+        f"{final_brier:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Mean predicted probability"
+)
+
+plt.ylabel(
+    "Observed positive proportion"
+)
+
+plt.title(
+    "Calibration - XGBoost Selector + SVM"
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_SVM_Calibration.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+calibration_df = pd.DataFrame({
+
+    "Mean_Predicted_Probability":
+        prob_pred,
+
+    "Observed_Positive_Proportion":
+        prob_true
+})
+
+
+# ================================================================
+# 29. METHOD INFORMATION
+# ================================================================
+
+method_info_df = pd.DataFrame({
+
+    "Item": [
+
+        "Number of patients",
+
+        "Initial radiomics features",
+
+        "Outer validation",
+
+        "Outer repetitions",
+
+        "Training fraction",
+
+        "Test fraction",
+
+        "Internal CV",
+
+        "Correlation method",
+
+        "Correlation threshold",
+
+        "Scaling",
+
+        "Feature selector",
+
+        "XGBoost importance type",
+
+        "XGB n_estimators",
+
+        "XGB max_depth",
+
+        "XGB learning_rate",
+
+        "Feature counts tested",
+
+        "Classifier",
+
+        "SVM kernels",
+
+        "SVM C values",
+
+        "SVM gamma",
+
+        "SVM class weight",
+
+        "Optimization metric",
+
+        "Classification threshold",
+
+        "Patient-level aggregation",
+
+        "Bootstrap repetitions",
+
+        "Global best feature count"
+    ],
+
+    "Value": [
+
+        len(y),
+
+        X.shape[1],
+
+        "Repeated stratified holdout",
+
+        N_OUTER_SPLITS,
+
+        1 - TEST_SIZE,
+
+        TEST_SIZE,
+
+        f"Stratified {INNER_FOLDS}-fold CV",
+
+        "Spearman absolute correlation",
+
+        CORRELATION_THRESHOLD,
+
+        "StandardScaler fitted within CV",
+
+        "XGBClassifier + SelectFromModel",
+
+        XGB_SELECTOR_IMPORTANCE_TYPE,
+
+        XGB_SELECTOR_N_ESTIMATORS,
+
+        XGB_SELECTOR_MAX_DEPTH,
+
+        XGB_SELECTOR_LEARNING_RATE,
+
+        str(
+            FEATURE_COUNTS
+        ),
+
+        "SVC with probability=True",
+
+        "linear, rbf",
+
+        "0.01, 0.1, 1, 10, 100",
+
+        "scale, 0.01, 0.1, 1 for RBF",
+
+        "None, balanced",
+
+        "ROC-AUC",
+
+        CLASSIFICATION_THRESHOLD,
+
+        "Mean held-out probability for each patient",
+
+        N_BOOTSTRAP,
+
+        global_best_k
+    ]
+})
+
+
+# ================================================================
+# 30. SAVE COMPLETE EXCEL
+# ================================================================
+
+FINAL_EXCEL = os.path.join(
+
+    OUTPUT_DIR,
+
+    "XGB_SVM_Final_Results.xlsx"
+)
+
+
+with pd.ExcelWriter(
+
+    FINAL_EXCEL,
+
+    engine="openpyxl"
+
+) as writer:
+
+
+    performance_ci_df.to_excel(
+        writer,
+        sheet_name="Performance_95CI",
+        index=False
+    )
+
+
+    confusion_df.to_excel(
+        writer,
+        sheet_name="Confusion_Matrix",
+        index=False
+    )
+
+
+    patient_oof_df.to_excel(
+        writer,
+        sheet_name="Patient_OOF",
+        index=False
+    )
+
+
+    outer_results_df.to_excel(
+        writer,
+        sheet_name="Outer_Splits",
+        index=False
+    )
+
+
+    k_results_df.to_excel(
+        writer,
+        sheet_name="K_InnerCV",
+        index=False
+    )
+
+
+    k_summary_df.to_excel(
+        writer,
+        sheet_name="K_Summary",
+        index=False
+    )
+
+
+    k_frequency_df.to_excel(
+        writer,
+        sheet_name="K_Frequency",
+        index=False
+    )
+
+
+    selected_features_df.to_excel(
+        writer,
+        sheet_name="Selected_Features",
+        index=False
+    )
+
+
+    feature_frequency_df.to_excel(
+        writer,
+        sheet_name="Feature_Frequency",
+        index=False
+    )
+
+
+    chosen_parameters_df.to_excel(
+        writer,
+        sheet_name="Chosen_SVM_Params",
+        index=False
+    )
+
+
+    hyperparameter_frequency_df.to_excel(
+        writer,
+        sheet_name="Hyperparam_Frequency",
+        index=False
+    )
+
+
+    test_predictions_df.to_excel(
+        writer,
+        sheet_name="HeldOut_Predictions",
+        index=False
+    )
+
+
+    roc_data_df.to_excel(
+        writer,
+        sheet_name="ROC_Data",
+        index=False
+    )
+
+
+    roc_band_df.to_excel(
+        writer,
+        sheet_name="ROC_95CI_Band",
+        index=False
+    )
+
+
+    pr_data_df.to_excel(
+        writer,
+        sheet_name="PR_Data",
+        index=False
+    )
+
+
+    pr_band_df.to_excel(
+        writer,
+        sheet_name="PR_95CI_Band",
+        index=False
+    )
+
+
+    calibration_df.to_excel(
+        writer,
+        sheet_name="Calibration",
+        index=False
+    )
+
+
+    method_info_df.to_excel(
+        writer,
+        sheet_name="Method_Info",
+        index=False
+    )
+
+
+# ================================================================
+# 31. FINAL OUTPUT
+# ================================================================
+
+print(
+    "\n========================================"
+)
+
+print(
+    "FINAL XGBOOST SELECTOR + SVM CLASSIFIER"
+)
+
+print(
+    "========================================"
+)
+
+
+print(
+
+    performance_ci_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nConfusion Matrix:"
+)
+
+print(
+    f"TN={tn}, "
+    f"FP={fp}, "
+    f"FN={fn}, "
+    f"TP={tp}"
+)
+
+
+print(
+    "\nGlobal best number of features "
+    "based on mean inner-CV AUC:"
+)
+
+print(
+    global_best_k
+)
+
+
+print(
+    "\nFeature-count summary:"
+)
+
+print(
+
+    k_summary_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nFeature-count selection frequency:"
+)
+
+print(
+
+    k_frequency_df
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected SVM parameters:"
+)
+
+print(
+
+    hyperparameter_frequency_df
+
+    .head(20)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected features:"
+)
+
+print(
+
+    feature_frequency_df
+
+    .head(20)
+
+    .round(4)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nExcel saved to:"
+)
+
+print(
+    FINAL_EXCEL
+)
+
+
+print(
+    "\nFigures saved to:"
+)
+
+print(
+    FIGURE_DIR
+)
+
+
+print(
+    "\nAnalysis completed successfully."
+)
+
+
+# ================================================================
+# XGBOOST FEATURE SELECTOR -> GAUSSIAN NAIVE BAYES CLASSIFIER
+#
+# 50 repeated stratified holdout splits
+# 85% training / 15% held-out test
+# Internal stratified 5-fold CV
+# Correlation filtering inside CV
+# Feature counts: 3-10
+# ================================================================
+
+
+# ================================================================
+# 1. IMPORTS
+# ================================================================
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, TransformerMixin
+
+from sklearn.model_selection import (
+    StratifiedShuffleSplit,
+    StratifiedKFold,
+    GridSearchCV,
+    ParameterGrid
+)
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectFromModel
+
+from sklearn.naive_bayes import GaussianNB
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    brier_score_loss,
+    roc_curve,
+    precision_recall_curve
+)
+
+from sklearn.calibration import calibration_curve
+
+from xgboost import XGBClassifier
+
+
+warnings.filterwarnings("ignore")
+
+
+# ================================================================
+# 2. USER SETTINGS
+# ================================================================
+
+INPUT_FILE = (
+    r"C:\Users\zaman\Downloads\radiomics_features_BW25.xlsx"
+)
+
+LABEL_COL = "label"
+
+ID_COL = None
+
+
+# ================================================================
+# 3. VALIDATION SETTINGS
+# ================================================================
+
+N_OUTER_SPLITS = 50
+
+TEST_SIZE = 0.15
+
+INNER_FOLDS = 5
+
+FEATURE_COUNTS = list(
+    range(3, 11)
+)
+
+CORRELATION_THRESHOLD = 0.90
+
+CLASSIFICATION_THRESHOLD = 0.50
+
+RANDOM_STATE = 42
+
+N_BOOTSTRAP = 5000
+
+
+# ================================================================
+# 4. FIXED XGBOOST FEATURE SELECTOR SETTINGS
+# ================================================================
+
+XGB_SELECTOR_N_ESTIMATORS = 100
+
+XGB_SELECTOR_MAX_DEPTH = 3
+
+XGB_SELECTOR_LEARNING_RATE = 0.05
+
+XGB_SELECTOR_SUBSAMPLE = 0.80
+
+XGB_SELECTOR_COLSAMPLE_BYTREE = 0.80
+
+XGB_SELECTOR_REG_ALPHA = 0.0
+
+XGB_SELECTOR_REG_LAMBDA = 1.0
+
+XGB_SELECTOR_IMPORTANCE_TYPE = "gain"
+
+
+# ================================================================
+# 5. OUTPUT
+# ================================================================
+
+desktop = os.path.join(
+    os.path.expanduser("~"),
+    "Desktop"
+)
+
+OUTPUT_DIR = os.path.join(
+    desktop,
+    "XGB_GNB_Revised_Results"
+)
+
+FIGURE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "Figures"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    FIGURE_DIR,
+    exist_ok=True
+)
+
+
+# ================================================================
+# 6. CORRELATION FILTER
+# ================================================================
+
+class CorrelationFilter(
+    BaseEstimator,
+    TransformerMixin
+):
+
+    def __init__(
+        self,
+        threshold=0.90,
+        method="spearman"
+    ):
+
+        self.threshold = threshold
+        self.method = method
+
+
+    def fit(
+        self,
+        X,
+        y=None
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+
+            X = pd.DataFrame(X)
+
+
+        self.feature_names_in_ = np.asarray(
+            X.columns
+        )
+
+
+        # --------------------------------------------------------
+        # Remove constant features
+        # --------------------------------------------------------
+
+        nunique = X.nunique(
+            dropna=False
+        )
+
+
+        self.constant_features_ = list(
+
+            nunique[
+                nunique <= 1
+            ].index
+        )
+
+
+        X_temp = X.drop(
+
+            columns=
+                self.constant_features_,
+
+            errors=
+                "ignore"
+        )
+
+
+        # --------------------------------------------------------
+        # Spearman correlation
+        # --------------------------------------------------------
+
+        corr = X_temp.corr(
+            method=self.method
+        ).abs()
+
+
+        upper = corr.where(
+
+            np.triu(
+
+                np.ones(
+                    corr.shape
+                ),
+
+                k=1
+
+            ).astype(bool)
+        )
+
+
+        self.correlated_features_ = [
+
+            column
+
+            for column
+            in upper.columns
+
+            if (
+
+                upper[column]
+                >
+                self.threshold
+
+            ).any()
+        ]
+
+
+        self.features_to_keep_ = [
+
+            column
+
+            for column
+            in X_temp.columns
+
+            if column
+            not in self.correlated_features_
+        ]
+
+
+        return self
+
+
+    def transform(
+        self,
+        X
+    ):
+
+        if not isinstance(
+            X,
+            pd.DataFrame
+        ):
+
+            X = pd.DataFrame(
+
+                X,
+
+                columns=
+                    self.feature_names_in_
+            )
+
+
+        return X[
+            self.features_to_keep_
+        ].copy()
+
+
+    def get_feature_names_out(
+        self,
+        input_features=None
+    ):
+
+        return np.asarray(
+            self.features_to_keep_
+        )
+
+
+# ================================================================
+# 7. LOAD DATA
+# ================================================================
+
+df = pd.read_excel(
+    INPUT_FILE
+)
+
+
+df.columns = (
+
+    df.columns
+    .astype(str)
+    .str.strip()
+)
+
+
+# ================================================================
+# 8. FIND LABEL
+# ================================================================
+
+if LABEL_COL not in df.columns:
+
+    possible_labels = [
+
+        "label",
+        "Label",
+        "Outcome",
+        "outcome"
+    ]
+
+
+    found = [
+
+        column
+
+        for column
+        in possible_labels
+
+        if column
+        in df.columns
+    ]
+
+
+    if len(found) == 0:
+
+        raise ValueError(
+            "Label column not found."
+        )
+
+
+    LABEL_COL = found[0]
+
+
+# ================================================================
+# 9. FIND PATIENT ID
+# ================================================================
+
+if ID_COL is None:
+
+    possible_ids = [
+
+        "PatientID",
+        "patient_id",
+        "Image",
+        "ID"
+    ]
+
+
+    found = [
+
+        column
+
+        for column
+        in possible_ids
+
+        if column
+        in df.columns
+    ]
+
+
+    if len(found) > 0:
+
+        ID_COL = found[0]
+
+    else:
+
+        ID_COL = "RowID"
+
+        df[ID_COL] = np.arange(
+            len(df)
+        )
+
+
+# ================================================================
+# 10. LABEL AND PATIENT IDs
+# ================================================================
+
+y = (
+
+    df[LABEL_COL]
+
+    .astype(int)
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+patient_ids = (
+
+    df[ID_COL]
+
+    .astype(str)
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 11. REMOVE METADATA
+# ================================================================
+
+metadata_cols = [
+
+    LABEL_COL,
+    ID_COL,
+
+    "PatientID",
+    "patient_id",
+    "ID",
+    "RowID",
+
+    "Image",
+    "ImageFile",
+
+    "MaskFile",
+    "MaskLabel",
+
+    "ROIVoxels",
+
+    "label",
+    "Label",
+    "Outcome",
+    "outcome"
+]
+
+
+X = df.drop(
+
+    columns=
+        metadata_cols,
+
+    errors=
+        "ignore"
+)
+
+
+# ================================================================
+# KEEP ONLY NUMERIC FEATURES
+# ================================================================
+
+non_numeric_columns = (
+
+    X.select_dtypes(
+        exclude=[np.number]
+    )
+
+    .columns
+
+    .tolist()
+)
+
+
+if len(
+    non_numeric_columns
+) > 0:
+
+    print(
+        "Dropping non-numeric columns:",
+        non_numeric_columns
+    )
+
+
+    X = X.drop(
+        columns=
+            non_numeric_columns
+    )
+
+
+X = X.reset_index(
+    drop=True
+)
+
+
+# ================================================================
+# SAFETY CHECKS
+# ================================================================
+
+if X.isna().any().any():
+
+    raise ValueError(
+        "Missing values found in feature matrix."
+    )
+
+
+if np.isinf(
+    X.to_numpy()
+).any():
+
+    raise ValueError(
+        "Infinite values found in feature matrix."
+    )
+
+
+if set(
+    np.unique(y)
+) != {0, 1}:
+
+    raise ValueError(
+        "Outcome must contain only 0 and 1."
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    "DATASET"
+)
+
+print(
+    "========================================"
+)
+
+
+print(
+    "Patients:",
+    len(y)
+)
+
+
+print(
+    "Radiomics features:",
+    X.shape[1]
+)
+
+
+print(
+    "\nClass distribution:"
+)
+
+
+print(
+    y.value_counts().sort_index()
+)
+
+
+# ================================================================
+# 12. GAUSSIAN NAIVE BAYES HYPERPARAMETER GRID
+# ================================================================
+#
+# GaussianNB does not have class_weight.
+#
+# var_smoothing is tuned inside the internal 5-fold CV.
+# ================================================================
+
+param_grid = {
+
+    "classifier__var_smoothing": [
+
+        1e-12,
+        3e-12,
+
+        1e-11,
+        3e-11,
+
+        1e-10,
+        3e-10,
+
+        1e-9,
+        3e-9,
+
+        1e-8,
+        3e-8,
+
+        1e-7,
+        3e-7,
+
+        1e-6
+    ]
+}
+
+
+print(
+    "\nGaussianNB hyperparameter combinations:",
+    len(
+        list(
+            ParameterGrid(
+                param_grid
+            )
+        )
+    )
+)
+
+
+# ================================================================
+# 13. METRIC FUNCTION
+# ================================================================
+
+def calculate_metrics(
+    y_true,
+    probabilities,
+    threshold=0.50
+):
+
+    y_true = np.asarray(
+        y_true
+    ).astype(int)
+
+
+    probabilities = np.asarray(
+        probabilities
+    ).astype(float)
+
+
+    predictions = (
+
+        probabilities
+        >= threshold
+
+    ).astype(int)
+
+
+    tn, fp, fn, tp = confusion_matrix(
+
+        y_true,
+
+        predictions,
+
+        labels=[0, 1]
+
+    ).ravel()
+
+
+    sensitivity = recall_score(
+
+        y_true,
+
+        predictions,
+
+        pos_label=1,
+
+        zero_division=0
+    )
+
+
+    specificity = recall_score(
+
+        y_true,
+
+        predictions,
+
+        pos_label=0,
+
+        zero_division=0
+    )
+
+
+    precision = precision_score(
+
+        y_true,
+
+        predictions,
+
+        zero_division=0
+    )
+
+
+    npv = (
+
+        tn / (tn + fn)
+
+        if (tn + fn) > 0
+
+        else 0
+    )
+
+
+    gmean = np.sqrt(
+
+        sensitivity
+        *
+        specificity
+    )
+
+
+    return {
+
+        "ROC_AUC":
+            roc_auc_score(
+                y_true,
+                probabilities
+            ),
+
+        "PR_AUC_AP":
+            average_precision_score(
+                y_true,
+                probabilities
+            ),
+
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Balanced_Accuracy":
+            balanced_accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Sensitivity":
+            sensitivity,
+
+        "Specificity":
+            specificity,
+
+        "Precision_PPV":
+            precision,
+
+        "NPV":
+            npv,
+
+        "F1":
+            f1_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "G_mean":
+            gmean,
+
+        "Brier_Score":
+            brier_score_loss(
+                y_true,
+                probabilities
+            ),
+
+        "TN":
+            tn,
+
+        "FP":
+            fp,
+
+        "FN":
+            fn,
+
+        "TP":
+            tp
+    }
+
+
+# ================================================================
+# 14. REPEATED STRATIFIED HOLDOUT
+# ================================================================
+
+outer_splitter = StratifiedShuffleSplit(
+
+    n_splits=
+        N_OUTER_SPLITS,
+
+    test_size=
+        TEST_SIZE,
+
+    random_state=
+        RANDOM_STATE
+)
+
+
+# ================================================================
+# STORAGE
+# ================================================================
+
+outer_results = []
+
+k_search_results = []
+
+test_prediction_records = []
+
+selected_feature_records = []
+
+chosen_parameter_records = []
+
+
+# ================================================================
+# 15. MAIN ANALYSIS
+# ================================================================
+
+for outer_number, (
+    train_idx,
+    test_idx
+) in enumerate(
+
+    outer_splitter.split(
+        X,
+        y
+    ),
+
+    start=1
+):
+
+
+    print(
+        "\n========================================"
+    )
+
+
+    print(
+        f"Outer repetition "
+        f"{outer_number}/"
+        f"{N_OUTER_SPLITS}"
+    )
+
+
+    print(
+        "========================================"
+    )
+
+
+    # ============================================================
+    # OUTER TRAINING AND HELD-OUT TEST DATA
+    # ============================================================
+
+    X_train = X.iloc[
+        train_idx
+    ].copy()
+
+
+    X_test = X.iloc[
+        test_idx
+    ].copy()
+
+
+    y_train = y.iloc[
+        train_idx
+    ].copy()
+
+
+    y_test = y.iloc[
+        test_idx
+    ].copy()
+
+
+    # ============================================================
+    # INTERNAL STRATIFIED 5-FOLD CV
+    # ============================================================
+
+    inner_cv = StratifiedKFold(
+
+        n_splits=
+            INNER_FOLDS,
+
+        shuffle=
+            True,
+
+        random_state=
+            RANDOM_STATE
+            +
+            outer_number
+    )
+
+
+    best_inner_auc = -np.inf
+
+    selected_k = None
+
+    selected_grid = None
+
+
+    # ============================================================
+    # TEST FEATURE COUNTS 3-10
+    # ============================================================
+
+    for num_features in FEATURE_COUNTS:
+
+
+        # ========================================================
+        # FIXED XGBOOST FEATURE SELECTOR
+        # ========================================================
+
+        xgb_selector = XGBClassifier(
+
+            objective=
+                "binary:logistic",
+
+            n_estimators=
+                XGB_SELECTOR_N_ESTIMATORS,
+
+            max_depth=
+                XGB_SELECTOR_MAX_DEPTH,
+
+            learning_rate=
+                XGB_SELECTOR_LEARNING_RATE,
+
+            subsample=
+                XGB_SELECTOR_SUBSAMPLE,
+
+            colsample_bytree=
+                XGB_SELECTOR_COLSAMPLE_BYTREE,
+
+            reg_alpha=
+                XGB_SELECTOR_REG_ALPHA,
+
+            reg_lambda=
+                XGB_SELECTOR_REG_LAMBDA,
+
+            importance_type=
+                XGB_SELECTOR_IMPORTANCE_TYPE,
+
+            eval_metric=
+                "logloss",
+
+            tree_method=
+                "hist",
+
+            random_state=
+                RANDOM_STATE,
+
+            n_jobs=
+                1
+        )
+
+
+        # ========================================================
+        # PIPELINE
+        #
+        # Spearman correlation filtering
+        #             ↓
+        # StandardScaler
+        #             ↓
+        # XGBoost feature selector
+        #             ↓
+        # Top k features
+        #             ↓
+        # Gaussian Naive Bayes
+        #
+        # ALL learned operations occur within inner CV.
+        # ========================================================
+
+        pipeline = Pipeline(
+
+            steps=[
+
+
+                (
+                    "corr_filter",
+
+                    CorrelationFilter(
+
+                        threshold=
+                            CORRELATION_THRESHOLD,
+
+                        method=
+                            "spearman"
+                    )
+                ),
+
+
+                (
+                    "scaler",
+
+                    StandardScaler()
+                ),
+
+
+                (
+                    "selector",
+
+                    SelectFromModel(
+
+                        estimator=
+                            xgb_selector,
+
+                        threshold=
+                            -np.inf,
+
+                        max_features=
+                            num_features
+                    )
+                ),
+
+
+                (
+                    "classifier",
+
+                    GaussianNB()
+                )
+            ]
+        )
+
+
+        # ========================================================
+        # GRID SEARCH
+        # ========================================================
+
+        grid_search = GridSearchCV(
+
+            estimator=
+                pipeline,
+
+            param_grid=
+                param_grid,
+
+            scoring=
+                "roc_auc",
+
+            cv=
+                inner_cv,
+
+            refit=
+                True,
+
+            n_jobs=
+                -1,
+
+            return_train_score=
+                False,
+
+            error_score=
+                "raise",
+
+            verbose=
+                0
+        )
+
+
+        # ========================================================
+        # FIT ONLY ON OUTER TRAINING SET
+        # ========================================================
+
+        grid_search.fit(
+
+            X_train,
+
+            y_train
+        )
+
+
+        current_inner_auc = (
+            grid_search.best_score_
+        )
+
+
+        best_params_k = (
+            grid_search.best_params_
+        )
+
+
+        # ========================================================
+        # STORE RESULT FOR THIS k
+        # ========================================================
+
+        k_search_results.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Num_Features":
+                num_features,
+
+            "Best_Inner_CV_AUC":
+                current_inner_auc,
+
+            "Best_var_smoothing":
+                best_params_k[
+                    "classifier__var_smoothing"
+                ]
+        })
+
+
+        print(
+
+            f"k={num_features} | "
+
+            f"Inner AUC="
+            f"{current_inner_auc:.3f} | "
+
+            f"var_smoothing="
+            f"{best_params_k['classifier__var_smoothing']:.1e}"
+        )
+
+
+        # ========================================================
+        # CHOOSE k WITH HIGHEST INNER-CV ROC-AUC
+        #
+        # Exact tie -> smaller k remains selected
+        # ========================================================
+
+        if (
+
+            current_inner_auc
+            >
+            best_inner_auc
+            +
+            1e-12
+
+        ):
+
+            best_inner_auc = (
+                current_inner_auc
+            )
+
+            selected_k = (
+                num_features
+            )
+
+            selected_grid = (
+                grid_search
+            )
+
+
+    # ============================================================
+    # 16. FINAL MODEL FOR THIS OUTER REPETITION
+    # ============================================================
+    #
+    # GridSearchCV(refit=True) means the optimized pipeline
+    # has already been refitted on the complete 85% training set.
+    #
+    # ============================================================
+
+    best_model = (
+
+        selected_grid
+        .best_estimator_
+    )
+
+
+    # ============================================================
+    # 17. HELD-OUT TEST EVALUATION
+    # ============================================================
+
+    y_test_prob = (
+
+        best_model
+
+        .predict_proba(
+            X_test
+        )[:, 1]
+    )
+
+
+    y_test_pred = (
+
+        y_test_prob
+
+        >=
+        CLASSIFICATION_THRESHOLD
+
+    ).astype(int)
+
+
+    test_metrics = calculate_metrics(
+
+        y_test,
+
+        y_test_prob,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    # ============================================================
+    # CORRELATION FILTER INFORMATION
+    # ============================================================
+
+    fitted_corr_filter = (
+
+        best_model
+
+        .named_steps[
+            "corr_filter"
+        ]
+    )
+
+
+    corr_feature_names = (
+
+        fitted_corr_filter
+        .get_feature_names_out()
+    )
+
+
+    # ============================================================
+    # SELECTED FEATURES
+    # ============================================================
+
+    fitted_selector = (
+
+        best_model
+
+        .named_steps[
+            "selector"
+        ]
+    )
+
+
+    selected_mask = (
+
+        fitted_selector
+        .get_support()
+    )
+
+
+    selected_feature_names = (
+
+        corr_feature_names[
+            selected_mask
+        ]
+    )
+
+
+    # ============================================================
+    # XGBOOST GAIN IMPORTANCE
+    # ============================================================
+
+    xgb_importance = (
+
+        fitted_selector
+
+        .estimator_
+
+        .feature_importances_
+    )
+
+
+    selected_importance = (
+
+        xgb_importance[
+            selected_mask
+        ]
+    )
+
+
+    for feature_name, importance in zip(
+
+        selected_feature_names,
+
+        selected_importance
+
+    ):
+
+        selected_feature_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Selected_K":
+                selected_k,
+
+            "Feature":
+                feature_name,
+
+            "XGB_Gain_Importance":
+                importance
+        })
+
+
+    # ============================================================
+    # CHOSEN GNB PARAMETER
+    # ============================================================
+
+    best_params = (
+        selected_grid
+        .best_params_
+    )
+
+
+    chosen_parameter_records.append({
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "var_smoothing":
+            best_params[
+                "classifier__var_smoothing"
+            ]
+    })
+
+
+    # ============================================================
+    # OUTER PERFORMANCE
+    # ============================================================
+
+    outer_record = {
+
+        "Outer_Repetition":
+            outer_number,
+
+        "Train_n":
+            len(train_idx),
+
+        "Test_n":
+            len(test_idx),
+
+        "Selected_K":
+            selected_k,
+
+        "Best_Inner_CV_AUC":
+            best_inner_auc,
+
+        "Features_after_Correlation":
+            len(
+                corr_feature_names
+            ),
+
+        "Constant_Features_Removed":
+            len(
+                fitted_corr_filter
+                .constant_features_
+            ),
+
+        "Correlated_Features_Removed":
+            len(
+                fitted_corr_filter
+                .correlated_features_
+            )
+    }
+
+
+    outer_record.update(
+        test_metrics
+    )
+
+
+    outer_results.append(
+        outer_record
+    )
+
+
+    # ============================================================
+    # HELD-OUT PATIENT PREDICTIONS
+    # ============================================================
+
+    for local_position, row_index in enumerate(
+        test_idx
+    ):
+
+        test_prediction_records.append({
+
+            "Outer_Repetition":
+                outer_number,
+
+            "Row_Index":
+                int(
+                    row_index
+                ),
+
+            "PatientID":
+                patient_ids.iloc[
+                    row_index
+                ],
+
+            "True_Label":
+                int(
+                    y.iloc[
+                        row_index
+                    ]
+                ),
+
+            "Test_Probability":
+                float(
+                    y_test_prob[
+                        local_position
+                    ]
+                ),
+
+            "Test_Prediction":
+                int(
+                    y_test_pred[
+                        local_position
+                    ]
+                ),
+
+            "Selected_K":
+                selected_k
+        })
+
+
+    # ============================================================
+    # CURRENT REPETITION
+    # ============================================================
+
+    print(
+        "\nSelected k:",
+        selected_k
+    )
+
+
+    print(
+        "Best inner CV AUC:",
+        round(
+            best_inner_auc,
+            3
+        )
+    )
+
+
+    print(
+        "Held-out test AUC:",
+        round(
+            test_metrics[
+                "ROC_AUC"
+            ],
+            3
+        )
+    )
+
+
+    print(
+        "Best GaussianNB parameters:",
+        best_params
+    )
+
+
+    # ============================================================
+    # CHECKPOINTS
+    # ============================================================
+
+    pd.DataFrame(
+        outer_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_outer_results.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        k_search_results
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_k_search.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        test_prediction_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_test_predictions.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        selected_feature_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_selected_features.csv"
+        ),
+
+        index=False
+    )
+
+
+    pd.DataFrame(
+        chosen_parameter_records
+    ).to_csv(
+
+        os.path.join(
+            OUTPUT_DIR,
+            "checkpoint_GNB_hyperparameters.csv"
+        ),
+
+        index=False
+    )
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    f"ALL {N_OUTER_SPLITS} REPETITIONS FINISHED"
+)
+
+print(
+    "========================================"
+)
+
+
+# ================================================================
+# 18. DATAFRAMES
+# ================================================================
+
+outer_results_df = pd.DataFrame(
+    outer_results
+)
+
+
+k_results_df = pd.DataFrame(
+    k_search_results
+)
+
+
+test_predictions_df = pd.DataFrame(
+    test_prediction_records
+)
+
+
+selected_features_df = pd.DataFrame(
+    selected_feature_records
+)
+
+
+chosen_parameters_df = pd.DataFrame(
+    chosen_parameter_records
+)
+
+
+# ================================================================
+# 19. PATIENT-LEVEL AGGREGATION
+# ================================================================
+#
+# If the same patient appears in multiple held-out test sets,
+# the held-out probabilities are averaged.
+#
+# ================================================================
+
+patient_oof_df = (
+
+    test_predictions_df
+
+    .groupby(
+        "Row_Index"
+    )
+
+    .agg(
+
+        PatientID=(
+            "PatientID",
+            "first"
+        ),
+
+        True_Label=(
+            "True_Label",
+            "first"
+        ),
+
+        Mean_OOF_Probability=(
+            "Test_Probability",
+            "mean"
+        ),
+
+        SD_OOF_Probability=(
+            "Test_Probability",
+            "std"
+        ),
+
+        Test_Appearances=(
+            "Test_Probability",
+            "size"
+        )
+    )
+
+    .reset_index()
+)
+
+
+patient_oof_df[
+    "SD_OOF_Probability"
+] = (
+
+    patient_oof_df[
+        "SD_OOF_Probability"
+    ]
+
+    .fillna(0)
+)
+
+
+patient_oof_df[
+    "OOF_Prediction"
+] = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+if len(
+    patient_oof_df
+) != len(y):
+
+    print(
+        "\nWARNING: Not every patient appeared "
+        "in the held-out test set."
+    )
+
+    print(
+        "Patients with held-out predictions:",
+        len(patient_oof_df),
+        "/",
+        len(y)
+    )
+
+
+patient_oof_df = (
+
+    patient_oof_df
+
+    .sort_values(
+        "Row_Index"
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+final_y = (
+
+    patient_oof_df[
+        "True_Label"
+    ]
+
+    .to_numpy()
+
+    .astype(int)
+)
+
+
+final_prob = (
+
+    patient_oof_df[
+        "Mean_OOF_Probability"
+    ]
+
+    .to_numpy()
+)
+
+
+# ================================================================
+# 20. FINAL PERFORMANCE
+# ================================================================
+
+final_metrics = calculate_metrics(
+
+    final_y,
+
+    final_prob,
+
+    threshold=
+        CLASSIFICATION_THRESHOLD
+)
+
+
+# ================================================================
+# 21. BOOTSTRAP 95% CONFIDENCE INTERVALS
+# ================================================================
+
+bootstrap_metrics = {
+
+    metric: []
+
+    for metric
+    in final_metrics
+
+    if metric not in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]
+}
+
+
+rng = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+n_patients = len(
+    final_y
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_boot = final_y[
+        idx
+    ]
+
+
+    p_boot = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_boot
+        )
+    ) < 2:
+
+        continue
+
+
+    boot_result = calculate_metrics(
+
+        y_boot,
+
+        p_boot,
+
+        threshold=
+            CLASSIFICATION_THRESHOLD
+    )
+
+
+    for metric in bootstrap_metrics:
+
+        bootstrap_metrics[
+            metric
+        ].append(
+
+            boot_result[
+                metric
+            ]
+        )
+
+
+# ================================================================
+# PERFORMANCE TABLE
+# ================================================================
+
+performance_rows = []
+
+
+for metric, estimate in final_metrics.items():
+
+    if metric in [
+        "TN",
+        "FP",
+        "FN",
+        "TP"
+    ]:
+
+        continue
+
+
+    values = np.asarray(
+
+        bootstrap_metrics[
+            metric
+        ]
+    )
+
+
+    performance_rows.append({
+
+        "Metric":
+            metric,
+
+        "Estimate":
+            estimate,
+
+        "95% CI Lower":
+            np.percentile(
+                values,
+                2.5
+            ),
+
+        "95% CI Upper":
+            np.percentile(
+                values,
+                97.5
+            )
+    })
+
+
+performance_ci_df = pd.DataFrame(
+    performance_rows
+)
+
+
+# ================================================================
+# 22. FINAL CONFUSION MATRIX
+# ================================================================
+
+final_predictions = (
+
+    final_prob
+
+    >=
+    CLASSIFICATION_THRESHOLD
+
+).astype(int)
+
+
+tn, fp, fn, tp = confusion_matrix(
+
+    final_y,
+
+    final_predictions,
+
+    labels=[0, 1]
+
+).ravel()
+
+
+confusion_df = pd.DataFrame({
+
+    "Measure": [
+
+        "TN",
+        "FP",
+        "FN",
+        "TP",
+        "Threshold"
+    ],
+
+    "Value": [
+
+        tn,
+        fp,
+        fn,
+        tp,
+        CLASSIFICATION_THRESHOLD
+    ]
+})
+
+
+# ================================================================
+# 23. FEATURE SELECTION FREQUENCY
+# ================================================================
+
+feature_frequency_df = (
+
+    selected_features_df
+
+    .groupby(
+        "Feature"
+    )
+
+    .agg(
+
+        Selection_Frequency=(
+            "Outer_Repetition",
+            "nunique"
+        ),
+
+        Mean_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "mean"
+        ),
+
+        SD_XGB_Gain=(
+            "XGB_Gain_Importance",
+            "std"
+        )
+    )
+
+    .reset_index()
+)
+
+
+feature_frequency_df[
+    "Selection_Percent"
+] = (
+
+    feature_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+feature_frequency_df = (
+
+    feature_frequency_df
+
+    .sort_values(
+
+        [
+            "Selection_Frequency",
+            "Mean_XGB_Gain"
+        ],
+
+        ascending=[
+            False,
+            False
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 24. FEATURE COUNT SUMMARY
+# ================================================================
+
+k_summary_df = (
+
+    k_results_df
+
+    .groupby(
+        "Num_Features"
+    )
+
+    .agg(
+
+        Mean_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "mean"
+        ),
+
+        SD_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "std"
+        ),
+
+        Median_Inner_CV_AUC=(
+            "Best_Inner_CV_AUC",
+            "median"
+        )
+    )
+
+    .reset_index()
+)
+
+
+max_mean_auc = (
+
+    k_summary_df[
+        "Mean_Inner_CV_AUC"
+    ]
+
+    .max()
+)
+
+
+global_best_k = int(
+
+    k_summary_df.loc[
+
+        np.isclose(
+
+            k_summary_df[
+                "Mean_Inner_CV_AUC"
+            ],
+
+            max_mean_auc
+        ),
+
+        "Num_Features"
+
+    ].min()
+)
+
+
+k_summary_df[
+    "Global_Best_K"
+] = (
+
+    k_summary_df[
+        "Num_Features"
+    ]
+
+    ==
+    global_best_k
+)
+
+
+# ================================================================
+# 25. SELECTED k FREQUENCY
+# ================================================================
+
+k_frequency_df = (
+
+    outer_results_df[
+        "Selected_K"
+    ]
+
+    .value_counts()
+
+    .sort_index()
+
+    .rename_axis(
+        "Selected_K"
+    )
+
+    .reset_index(
+        name=
+            "Selection_Frequency"
+    )
+)
+
+
+k_frequency_df[
+    "Selection_Percent"
+] = (
+
+    k_frequency_df[
+        "Selection_Frequency"
+    ]
+
+    /
+    N_OUTER_SPLITS
+
+    *
+    100
+)
+
+
+# ================================================================
+# 26. GNB HYPERPARAMETER FREQUENCY
+# ================================================================
+
+hyperparameter_frequency_df = (
+
+    chosen_parameters_df
+
+    .groupby(
+
+        [
+            "Selected_K",
+            "var_smoothing"
+        ],
+
+        dropna=False
+    )
+
+    .size()
+
+    .reset_index(
+        name="Frequency"
+    )
+
+    .sort_values(
+        "Frequency",
+        ascending=False
+    )
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ================================================================
+# 27. ROC CURVE + 95% BOOTSTRAP BAND
+# ================================================================
+
+fpr, tpr, roc_thresholds = roc_curve(
+
+    final_y,
+
+    final_prob
+)
+
+
+final_auc = roc_auc_score(
+
+    final_y,
+
+    final_prob
+)
+
+
+mean_fpr = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_tprs = []
+
+
+rng_roc = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng_roc.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    fpr_b, tpr_b, _ = roc_curve(
+
+        y_b,
+
+        p_b
+    )
+
+
+    interp_tpr = np.interp(
+
+        mean_fpr,
+
+        fpr_b,
+
+        tpr_b
+    )
+
+
+    interp_tpr[0] = 0.0
+
+    interp_tpr[-1] = 1.0
+
+
+    bootstrap_tprs.append(
+        interp_tpr
+    )
+
+
+bootstrap_tprs = np.asarray(
+    bootstrap_tprs
+)
+
+
+roc_lower = np.percentile(
+
+    bootstrap_tprs,
+
+    2.5,
+
+    axis=0
+)
+
+
+roc_upper = np.percentile(
+
+    bootstrap_tprs,
+
+    97.5,
+
+    axis=0
+)
+
+
+auc_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ]
+
+    ==
+    "ROC_AUC"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    fpr,
+
+    tpr,
+
+    linewidth=2,
+
+    label=(
+
+        f"AUC = {final_auc:.3f} "
+
+        f"(95% CI "
+
+        f"{auc_row['95% CI Lower']:.3f}-"
+
+        f"{auc_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    mean_fpr,
+
+    roc_lower,
+
+    roc_upper,
+
+    alpha=0.2,
+
+    label=
+        "95% bootstrap band"
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label=
+        "Chance"
+)
+
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+
+plt.title(
+    "ROC Curve - XGBoost Selector + GaussianNB"
+)
+
+
+plt.legend(
+    loc="lower right"
+)
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_GNB_ROC_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+roc_data_df = pd.DataFrame({
+
+    "FPR":
+        fpr,
+
+    "TPR":
+        tpr,
+
+    "Threshold":
+        roc_thresholds
+})
+
+
+roc_band_df = pd.DataFrame({
+
+    "FPR":
+        mean_fpr,
+
+    "TPR_95CI_Lower":
+        roc_lower,
+
+    "TPR_95CI_Upper":
+        roc_upper
+})
+
+
+# ================================================================
+# 28. PRECISION-RECALL CURVE + 95% BOOTSTRAP BAND
+# ================================================================
+
+precision, recall, _ = (
+    precision_recall_curve(
+
+        final_y,
+
+        final_prob
+    )
+)
+
+
+final_ap = (
+    average_precision_score(
+
+        final_y,
+
+        final_prob
+    )
+)
+
+
+prevalence = np.mean(
+    final_y
+)
+
+
+recall_grid = np.linspace(
+    0,
+    1,
+    200
+)
+
+
+bootstrap_precisions = []
+
+
+rng_pr = np.random.default_rng(
+    RANDOM_STATE
+)
+
+
+for _ in range(
+    N_BOOTSTRAP
+):
+
+    idx = rng_pr.choice(
+
+        np.arange(
+            n_patients
+        ),
+
+        size=
+            n_patients,
+
+        replace=
+            True
+    )
+
+
+    y_b = final_y[
+        idx
+    ]
+
+
+    p_b = final_prob[
+        idx
+    ]
+
+
+    if len(
+        np.unique(
+            y_b
+        )
+    ) < 2:
+
+        continue
+
+
+    precision_b, recall_b, _ = (
+        precision_recall_curve(
+
+            y_b,
+
+            p_b
+        )
+    )
+
+
+    interp_precision = np.interp(
+
+        recall_grid,
+
+        recall_b[::-1],
+
+        precision_b[::-1]
+    )
+
+
+    bootstrap_precisions.append(
+        interp_precision
+    )
+
+
+bootstrap_precisions = np.asarray(
+    bootstrap_precisions
+)
+
+
+pr_lower = np.percentile(
+
+    bootstrap_precisions,
+
+    2.5,
+
+    axis=0
+)
+
+
+pr_upper = np.percentile(
+
+    bootstrap_precisions,
+
+    97.5,
+
+    axis=0
+)
+
+
+ap_row = performance_ci_df.loc[
+
+    performance_ci_df[
+        "Metric"
+    ]
+
+    ==
+    "PR_AUC_AP"
+
+].iloc[0]
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    recall,
+
+    precision,
+
+    linewidth=2,
+
+    label=(
+
+        f"AP = {final_ap:.3f} "
+
+        f"(95% CI "
+
+        f"{ap_row['95% CI Lower']:.3f}-"
+
+        f"{ap_row['95% CI Upper']:.3f})"
+    )
+)
+
+
+plt.fill_between(
+
+    recall_grid,
+
+    pr_lower,
+
+    pr_upper,
+
+    alpha=0.2,
+
+    label=
+        "95% bootstrap band"
+)
+
+
+plt.axhline(
+
+    prevalence,
+
+    linestyle="--",
+
+    label=(
+
+        f"Baseline prevalence = "
+        f"{prevalence:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Recall"
+)
+
+
+plt.ylabel(
+    "Precision"
+)
+
+
+plt.title(
+    "Precision-Recall Curve - XGBoost Selector + GaussianNB"
+)
+
+
+plt.legend(
+    loc="lower left"
+)
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_GNB_PR_95CI.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+pr_data_df = pd.DataFrame({
+
+    "Recall":
+        recall,
+
+    "Precision":
+        precision
+})
+
+
+pr_band_df = pd.DataFrame({
+
+    "Recall":
+        recall_grid,
+
+    "Precision_95CI_Lower":
+        pr_lower,
+
+    "Precision_95CI_Upper":
+        pr_upper
+})
+
+
+# ================================================================
+# 29. CALIBRATION
+# ================================================================
+
+prob_true, prob_pred = calibration_curve(
+
+    final_y,
+
+    final_prob,
+
+    n_bins=
+        5,
+
+    strategy=
+        "quantile"
+)
+
+
+final_brier = brier_score_loss(
+
+    final_y,
+
+    final_prob
+)
+
+
+plt.figure(
+    figsize=(6, 6)
+)
+
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--",
+
+    label=
+        "Perfect calibration"
+)
+
+
+plt.plot(
+
+    prob_pred,
+
+    prob_true,
+
+    marker="o",
+
+    linewidth=2,
+
+    label=(
+
+        f"Brier score = "
+        f"{final_brier:.3f}"
+    )
+)
+
+
+plt.xlabel(
+    "Mean predicted probability"
+)
+
+
+plt.ylabel(
+    "Observed positive proportion"
+)
+
+
+plt.title(
+    "Calibration - XGBoost Selector + GaussianNB"
+)
+
+
+plt.legend()
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+
+    os.path.join(
+        FIGURE_DIR,
+        "XGB_GNB_Calibration.png"
+    ),
+
+    dpi=300,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+calibration_df = pd.DataFrame({
+
+    "Mean_Predicted_Probability":
+        prob_pred,
+
+    "Observed_Positive_Proportion":
+        prob_true
+})
+
+
+# ================================================================
+# 30. METHOD INFORMATION
+# ================================================================
+
+method_info_df = pd.DataFrame({
+
+    "Item": [
+
+        "Number of patients",
+
+        "Initial radiomics features",
+
+        "Outer validation",
+
+        "Outer repetitions",
+
+        "Training fraction",
+
+        "Test fraction",
+
+        "Internal CV",
+
+        "Correlation method",
+
+        "Correlation threshold",
+
+        "Scaling",
+
+        "Feature selector",
+
+        "XGBoost importance type",
+
+        "XGB n_estimators",
+
+        "XGB max_depth",
+
+        "XGB learning_rate",
+
+        "XGB subsample",
+
+        "XGB colsample_bytree",
+
+        "Feature counts tested",
+
+        "Classifier",
+
+        "GaussianNB var_smoothing",
+
+        "Optimization metric",
+
+        "Classification threshold",
+
+        "Patient-level aggregation",
+
+        "Bootstrap repetitions",
+
+        "Global best feature count"
+    ],
+
+    "Value": [
+
+        len(y),
+
+        X.shape[1],
+
+        "Repeated stratified holdout",
+
+        N_OUTER_SPLITS,
+
+        1 - TEST_SIZE,
+
+        TEST_SIZE,
+
+        f"Stratified {INNER_FOLDS}-fold CV",
+
+        "Spearman absolute correlation",
+
+        CORRELATION_THRESHOLD,
+
+        "StandardScaler fitted within CV",
+
+        "XGBClassifier + SelectFromModel",
+
+        XGB_SELECTOR_IMPORTANCE_TYPE,
+
+        XGB_SELECTOR_N_ESTIMATORS,
+
+        XGB_SELECTOR_MAX_DEPTH,
+
+        XGB_SELECTOR_LEARNING_RATE,
+
+        XGB_SELECTOR_SUBSAMPLE,
+
+        XGB_SELECTOR_COLSAMPLE_BYTREE,
+
+        str(
+            FEATURE_COUNTS
+        ),
+
+        "GaussianNB",
+
+        str(
+            param_grid[
+                "classifier__var_smoothing"
+            ]
+        ),
+
+        "ROC-AUC",
+
+        CLASSIFICATION_THRESHOLD,
+
+        (
+            "Mean held-out probability "
+            "for each patient"
+        ),
+
+        N_BOOTSTRAP,
+
+        global_best_k
+    ]
+})
+
+
+# ================================================================
+# 31. SAVE COMPLETE EXCEL WORKBOOK
+# ================================================================
+
+FINAL_EXCEL = os.path.join(
+
+    OUTPUT_DIR,
+
+    "XGB_GNB_Final_Results.xlsx"
+)
+
+
+with pd.ExcelWriter(
+
+    FINAL_EXCEL,
+
+    engine="openpyxl"
+
+) as writer:
+
+
+    performance_ci_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Performance_95CI",
+
+        index=False
+    )
+
+
+    confusion_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Confusion_Matrix",
+
+        index=False
+    )
+
+
+    patient_oof_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Patient_OOF",
+
+        index=False
+    )
+
+
+    outer_results_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Outer_Splits",
+
+        index=False
+    )
+
+
+    k_results_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_InnerCV",
+
+        index=False
+    )
+
+
+    k_summary_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_Summary",
+
+        index=False
+    )
+
+
+    k_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "K_Frequency",
+
+        index=False
+    )
+
+
+    selected_features_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Selected_Features",
+
+        index=False
+    )
+
+
+    feature_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Feature_Frequency",
+
+        index=False
+    )
+
+
+    chosen_parameters_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Chosen_GNB_Params",
+
+        index=False
+    )
+
+
+    hyperparameter_frequency_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Hyperparam_Frequency",
+
+        index=False
+    )
+
+
+    test_predictions_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "HeldOut_Predictions",
+
+        index=False
+    )
+
+
+    roc_data_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "ROC_Data",
+
+        index=False
+    )
+
+
+    roc_band_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "ROC_95CI_Band",
+
+        index=False
+    )
+
+
+    pr_data_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "PR_Data",
+
+        index=False
+    )
+
+
+    pr_band_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "PR_95CI_Band",
+
+        index=False
+    )
+
+
+    calibration_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Calibration",
+
+        index=False
+    )
+
+
+    method_info_df.to_excel(
+
+        writer,
+
+        sheet_name=
+            "Method_Info",
+
+        index=False
+    )
+
+
+# ================================================================
+# 32. FINAL OUTPUT
+# ================================================================
+
+print(
+    "\n========================================"
+)
+
+
+print(
+    "FINAL XGBOOST SELECTOR + GAUSSIAN NB CLASSIFIER"
+)
+
+
+print(
+    "========================================"
+)
+
+
+print(
+
+    performance_ci_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nConfusion Matrix:"
+)
+
+
+print(
+
+    f"TN={tn}, "
+    f"FP={fp}, "
+    f"FN={fn}, "
+    f"TP={tp}"
+)
+
+
+print(
+    "\nGlobal best number of features "
+    "based on mean inner-CV AUC:"
+)
+
+
+print(
+    global_best_k
+)
+
+
+print(
+    "\nFeature-count summary:"
+)
+
+
+print(
+
+    k_summary_df
+
+    .round(3)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nFeature-count selection frequency:"
+)
+
+
+print(
+
+    k_frequency_df
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected GaussianNB parameters:"
+)
+
+
+print(
+
+    hyperparameter_frequency_df
+
+    .head(20)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nMost frequently selected features:"
+)
+
+
+print(
+
+    feature_frequency_df
+
+    .head(20)
+
+    .round(4)
+
+    .to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nExcel saved to:"
+)
+
+
+print(
+    FINAL_EXCEL
+)
+
+
+print(
+    "\nFigures saved to:"
+)
+
+
+print(
+    FIGURE_DIR
+)
+
+
+print(
+    "\nAnalysis completed successfully."
+)
